@@ -1,0 +1,38 @@
+#!/bin/bash
+# Wrapper script to run rolling backups using ec2-create-rolling-snapshot script
+# needs 'multiverse' enabled (using AWS sources) to install ec2-api-tools
+# which itself pulls in java
+# Also needs custom script ec2-create-rolling-snapshot in the path
+# (has been put in /usr/local/ec2 along with the official ec2 stuff)
+
+set -e
+
+ALERT_EMAIL="alerts@EXAMPLE.COM"
+
+errorb(){
+    echo !! exited abnormally with args: $@
+    echo -e "The rolling snapshots controlled by '${HOSTNAME}' exited abnormally, using settings:\n\n $@" | mail -s "${HOSTNAME} ERROR: rolling snapshot error" $ALERT_EMAIL
+}
+trap 'errorb $@' ERR # vars must be in single quotes with traps
+
+export JAVA_HOME='/usr'
+export EC2_HOME='/usr/local/ec2'
+export EC2_URL='ec2.ap-southeast-1.amazonaws.com'
+export PATH="$PATH:$EC2_HOME/bin"
+##'backup' user in AWS IAM console:
+# dynamic key access
+# '\K' in grep kills the matching part so far, returning the rest of the match
+role=$(curl -s http://169.254.169.254/latest/meta-data/iam/info |\
+         grep -Po '"InstanceProfileArn" : "\K[^\"]*' |\
+         xargs basename)
+export AWS_ACCESS_KEY=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$role | grep -Po '"AccessKeyId" : "\K[^\"]*')
+export AWS_SECRET_KEY=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/$role | grep -Po '"SecretAccessKey" : "\K[^\"]*')
+
+
+#echo "role=$role, key=$AWS_ACCESS_KEY, secret=$AWS_SECRET_KEY"
+
+
+# $@ = all args passed through
+ec2-create-rolling-snapshot "$@" > /dev/null
+
+

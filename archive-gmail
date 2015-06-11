@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Script to archive a gmail mailbox, saving the emails so we can delete
+# accounts
+
+USERNAME=$1
+DOMAIN="EXAMPLE.COM"
+MAILSERVER="imap.gmail.com"
+FOLDER="[Gmail]/All Mail"
+
+if [ -z "$1" ]; then
+cat << EOF
+ USAGE:
+    $0 USERNAME [FOLDER]
+
+Archive a Small World Social gmail account to .mbox.zip format, for storing in
+backup before deleting a user account.  The username arg is the pre-"@" part of
+the full email address.
+
+The FOLDER will default to "$FOLDER" which is the current default Gmail
+hold-all folder. A different folder can be specified, but make sure you enquote
+it if there are spaces in the name.
+
+ WARNING: Large mail accounts can take quite some time to download
+          as it's done one email at a time.
+
+EOF
+exit 0
+fi
+
+if [ -n "$2" ]; then
+	FOLDER="$2"
+fi
+
+
+command -v fetchmail >/dev/null 2>&1 || { echo >&2 "Fetchmail is required to run this script, please install it.  Aborting."; exit 1; }
+command -v formail >/dev/null 2>&1 || { echo >&2 "Formail is required to run this script, it's in the procmail package, please install it.  Aborting."; exit 1; }
+command -v zip >/dev/null 2>&1 || { echo >&2 "Zip is required to run this script, please install it.  Aborting."; exit 1; }
+
+if [ -s $USERNAME.mbox ]; then
+	echo "Existing $USERNAME.mbox file found, perhaps left over from previous attempt?"
+	echo "Pulling mail will append to existing file, which will double up mail."
+	echo "Please [re]move existing file and try again."
+	echo "Aborting..."
+	exit 1
+fi
+
+echo "Fetching $FOLDER for ${USERNAME}@$DOMAIN from $MAILSERVER..."
+fetchmail -a -k -u ${USERNAME}@$DOMAIN -p IMAP -P 993 -r "${FOLDER}" --ssl -m "formail -c >> ./${USERNAME}.mbox"  $MAILSERVER
+if [ $? != 0 ]; then
+	echo "Fetchmail encountered an error, aborting archive script..."
+	exit 1
+fi
+
+echo "Zipping $USERNAME.mbox, please provide zip password..."
+zip -e $USERNAME.mbox.zip $USERNAME.mbox
+if [ -s $USERNAME.mbox.zip ]; then
+	echo "Compression finished, please send $USERNAME.mbox.zip to backup location."
+	echo "Consider removing $USERNAME.mbox after zip backup - it may be quite large."
+	echo "Finished."
+else
+	echo "Something went wrong - mbox.zip not found or of zero size. Check it out."
+fi
+
+

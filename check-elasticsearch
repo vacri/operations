@@ -1,0 +1,73 @@
+#!/bin/bash
+
+# Nagios Check - ElasticSearch status in production
+
+OKAY=3
+CRITICAL=1
+
+usage(){
+cat << EOF
+Usage:
+  $0 -h hostname [-o 3] [-c 1]
+
+Where
+ -h is the Nagios-approved hostname
+ -o is the minimum number of active "number_of_data_nodes" to be OK
+ -c at this "number_of_data_nodes" or lower, raise a CRITICAL
+
+A "number_of_data_nodes" between OK and CRITICAL will raise a WARNING
+
+The default values are the ones shown in the example above, and the CRITICAL
+must be below the OK value.
+
+WARNING: THIS SCRIPT IS BRITTLE. It assumes the location of the
+number_of_nodes. Needs rewriting in Perl for json interpretation 
+
+EOF
+}
+
+if [ -z "$1" ]; then
+	usage
+	exit 0
+fi
+
+if [ ! -z "$2" ]; then
+
+
+	limit=$[ ($#/2) ]  # number of args halved
+	for ((i=0;i<$limit;i++)){
+	case $1 in 
+		"-o") OKAY="$2";;
+		"-c") CRITICAL="$2";;
+		"-h") DOMAIN="$2";;
+		*) echo "ERROR: Unknown argument supplied. Aborting..."; exit 3;;
+	esac
+
+	shift 2
+	}
+fi
+
+if [ -z "$DOMAIN" ]; then
+	echo "ERROR: No host specified"
+	usage
+	exit 3
+fi
+
+if [ "$CRITICAL" -ge "$OKAY" ]; then
+	echo "ERROR: Critical not set lower than OK - check your values"
+	usage
+	exit 3
+fi
+
+#echo "-h $DOMAIN -o $OKAY -w $WARNING -c $CRITICAL"
+
+
+
+RESULT=`curl -s -XGET "http://$DOMAIN:9200/_cluster/health" | cut -d '"' -f13 | cut -c2`
+
+if [ "$RESULT" -ge "$OKAY" ]; then echo "OK - $RESULT nodes seen"; exit 0; fi
+if [ "$RESULT" -le "$CRITICAL" ]; then echo "CRITICAL - $RESULT nodes seen, expecting $OKAY";exit 2; fi
+if [ "$RESULT" -lt "$OKAY" ]; then echo "WARNING - $RESULT nodes seen, expecting $OKAY"; exit 1; fi
+echo "UNKOWN - uninterpretable result returned"; exit 3
+
+

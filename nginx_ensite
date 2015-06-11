@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Author: Alexander Schulz
+
+VHOSTEN="/etc/nginx/sites-enabled/"
+VHOSTAV="/etc/nginx/sites-available/"
+
+if [[ $1 == "-h" ]] || [[ $1 == "--help" ]]
+then
+        echo 'Usage: n2ensite VHOST [-f]'
+        echo 'Enables Nginxs virtualhost VHOST [option].'
+        echo -e '  -f\t\tForce enabling VHOST'
+        echo -e '    \t\tAlways sepcify -f after VHOST!'
+        echo -e '  -h, --help\tDisplays this help'
+        exit 0
+elif [ -f $VHOSTAV$1 ] && ( [ ! -f $VHOSTEN$1 ] || [[ $2 == "-f" ]] )
+then
+        if nginx -t &> /dev/null
+        then
+                [[ $2 == "-f" ]] && rm $VHOSTEN$1 &> /dev/null
+                ln -s $VHOSTAV$1 $VHOSTEN$1
+                if nginx -t &> /dev/null || [[ $2 == "-f" ]]
+                then
+                        echo "Restart Nginx now with \"/etc/init.d/nginx restart\" to enable the change!"
+                        exit 0
+                else
+                        rm $VHOSTEN$1
+                        echo "Error in the virtualhost config, disabled again."
+                        exit 1
+                fi
+        else
+                echo "Error in the Nginx configuration, not enabling the virtualhost."
+                exit 2
+        fi
+elif [ -f $VHOSTEN$1 ]
+then
+        echo "Virtualhost already enabled."
+        exit 0
+else
+        echo "Virtualhost config not found."
+        exit 1
+fi

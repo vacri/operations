@@ -1,0 +1,55 @@
+#!/bin/bash
+# Boilerplate for bash scripts
+# NOTE: positional args are converted from $1 to $ARG1 for use with 'set -u'
+# replace this bit with a sysadmin desc of script
+
+set -e    # fail immediately on error
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME [list of args]
+
+more info in prose form goes here
+EOF
+exit 0
+}
+
+# basic bash colours for fun
+RED="\e[31m";GREEN="\e[32m";YELLOW="\e[33m";BLUE="\e[34m";MAG="\e[35m"
+CYAN="\e[36m";GRAY="\e[37m";INV="\e[7m";HC="\e[1m";RHC="\e[21m";RS="\e[0m"
+
+# getopts colon after letter = opt requires an argument (taken as $OPTARG)
+while getopts "ab:" option; do
+    case $option in 
+        a) VAR="foo";;
+        b) VAR2="$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$1" ]; then usage; fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u    # fail on unset variables
+
+cleanup(){
+    #echo "Cleaning up..." # do cleanup here
+    :
+}
+
+alert(){
+    #echo "Alert! Errorb!" # don't do cleanup here
+    :
+}
+
+trap cleanup exit # on any exit
+trap alert ERR    # on an error (though can't pass any information about error)
+                  # looks like 'trap ERR' doesn't play nicely with 'set -e'
+
+# script goes here

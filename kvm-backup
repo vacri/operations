@@ -1,0 +1,156 @@
+#!/bin/bash
+
+
+
+#
+# Keep the house clean
+#
+days_to_keep="30" # cron it weekly for fourish copies
+ALERT_MAIL="itadmin@EXAMPLE.COM"
+#
+# Store backups here. NFS to another machine would make sense.
+# so that your backups are not local.
+#
+backup_dir="/home/paul/backup"
+
+#
+# Logs go here.
+#
+log_dir="/home/paul/backup/logs"
+
+if [ -z "$1" ]; then cat << EOF
+Usage: $0 [LIST] [OF] [VMS] [TO] [BACKUP]
+
+$(basename $0) is used to backup kvm virtual machines which weren't installed on
+lvm and aren't qcow2 format, and hence aren't readily snapshottable. The script
+user must have access to virsh and have read rights on the image file.
+
+The backup requires that the virtual machine be turned off by the script for
+the duration of the copy. Backing up to a different block device than where
+the original image lives is probably a good idea...
+
+Current directories:
+backup: $backup_dir
+logs: $log_dir
+
+Pinched and modified from:
+http://www.oracletool.com/blog/quick-and-dirty-script-for-making-cold-backups-of-kvm-virtual-machines/
+
+EOF
+exit 0
+fi
+
+#
+
+# This is who we'll back up
+#
+machines="$@" # all args given to script
+
+# End parameters
+#
+#=================================================================
+
+if [[ ! -d $log_dir ]] || [[ ! -d $backup_dir ]]; then
+    echo "Missing destination directory $backup_dir or $log_dir, aborting..."
+    exit 1
+fi
+
+errCheck () {
+    # check if the previous command returned non 0 exit code and report
+    ECODE=$?
+    echo "   Return code: $ECODE"
+    if [ "$ECODE" != 0 ]; then
+        echo !! exited abnormally $1
+        echo -e "The kvm backup script failed to complete backup of $machine with message: $1" | mail -s "KVM BACKUP ERROR" -t $ALERT_EMAIL
+        #exit 1
+    fi
+}
+
+#
+# Timestamp for the log file
+#
+#right_now=`date '+%m%d%Y_%H%M%p'`
+right_now=$(date '+%Y%m%d_%H%M')
+
+LOGNAME=backup_vms.${right_now}.log
+
+exec 1>/${log_dir}/$LOGNAME 2>&1
+
+print_date() {
+    #date '+%m%d%Y_%H%M%p'
+    date '+%Y%m%d_%H%M'
+}
+
+for machine in $machines
+do
+   if [[ ! -d ${backup_dir}/${machine} ]];
+   then
+      mkdir -p ${backup_dir}/${machine}
+   fi
+
+   echo "Backing up VM configuration"
+   virsh dumpxml $machine > ${backup_dir}/${machine}/${machine}.xml
+
+   VM_STATUS=$(virsh dominfo $machine | grep "^State:" | awk '{print $2}')
+
+   if [ "$VM_STATUS" = "running" ]; then
+      echo "Sending shutdown signal to $machine"
+      virsh shutdown $machine
+      errCheck "Failed to shutdown machine '$machine'"
+   fi
+
+   echo -n "Waiting for machine to shut down "
+   for i in $(seq 1 30)
+   do
+      echo -n "."
+      virsh list | grep -v "^$" | grep -v "^ Id" | grep -v "\-\-\-\-\-" | awk '{print $2" "$3}' | grep $machine | while read name state
+      do
+         if [[ $state -eq "running" ]]
+         then
+            sleep 10
+         fi
+      done
+   done
+
+   echo "Copying disk(s)"
+   virsh domblklist $machine | grep -v "^$" | grep -v "^Target" | grep -v "\-\-\-\-\-" | awk '{print $2}' | while read disk
+   do
+      if [ "$disk" = "-" ]; then
+          echo "   Skipping unsourced/disconnected disk (possibly virtual optical drive)"
+          continue
+      fi
+      echo "   $disk ..."
+      copy_disk="${backup_dir}/${machine}/$(basename ${disk}).$(print_date)"
+      echo "   Copying $disk to $copy_disk"
+      fuser $disk 1>/dev/null 2>&1
+      if (( $? == 0 ))
+      then
+         echo "   Disk $disk is still in use! "
+         echo -e "The kvm backup script failed to complete backup of $machine with message: Disk $disk is still in use!" | mail -s "KVM BACKUP ERROR" -t $ALERT_EMAIL
+      else
+         echo "   Copy started at `print_date`"
+         cp $disk $copy_disk
+         errCheck "Failed to back up disk $disk on '$machine'"
+         echo "   Copy ended at `print_date`"
+         #echo "   Backgrounding bzip of $copy_disk" #let's not bzip on a remote partition...
+         #nohup bzip2 $copy_disk &
+      fi
+   done
+
+   if [ "$VM_STATUS" = "running" ]; then
+      echo "Starting machine $machine"
+      virsh start $machine
+      errCheck "Failed to restart '$machine'"
+      echo
+   else
+      echo "   '$machine' not initially found running, left shut off."
+   fi
+
+   echo
+
+done
+
+echo "Removing old backups."
+find $backup_dir -type f -mtime +$days_to_keep -ls
+find $backup_dir -type f -mtime +$days_to_keep -exec rm -f {} \;
+echo
