@@ -1,0 +1,110 @@
+#!/bin/bash
+#
+# Backup script for mongo database backup, to be run from database server
+# and subsequently grabbed by backup server. Meant to be run as a cronjob
+
+PROGNAME=$(basename $0)
+
+if [ -z "$1" ]; then
+cat << EOF
+Usage:
+    $PROGNAME [dbname]
+    $PROGNAME all
+
+'$PROGNAME' will back up the nominated database, or 'all' databases. It is a wrapper for mongo_dump. It will only work with the first argument nominated.
+
+'$PROGNAME' is designed to be called several times per day. The first time the script is run each day, it will create a daily backup (with a simlink marked 'daily', dated with day-of-month), and every time the script is run it will create an 'on-demand' timestamped copy. The daily backups are overwritten the next month(ish) when the same match occurs. The 'on-demand' copies will be destroyed if they're over 48 hours old when the script runs. These times are governed by the ages of the backup files.
+
+
+To restore from the backup, use the native restore command:
+
+    mongorestore -d [database name] [--drop] --objcheck [-w 3] [directory with extracted db backup]
+    mongorestore -d kpmg_com_au --drop --objcheck -w 3 kpmg_com_au/
+
+  --drop destroys the existing database
+  --objcheck validates all objects being inserted
+  -w [NUM] ensures a write to at least NUM replicas
+
+EOF
+exit 1 # run as a cronjob, nice to error if no args :)
+fi
+
+DAY=`date +%d`
+MONTH=`date +%m`
+YEAR=`date +%y`
+DATE=`date +%e-%m-%y`
+CTIME=$(date +%y-%m-%d-%H%M)
+HDIR="$(echo ~)"
+MDIR="mongo"
+WDIR="$HDIR/$MDIR"
+TDIR="$HDIR/tars"
+ALERT_EMAIL="alerts@EXAMPLE.COM"
+
+##TODO: differentiate between AWS and DD locations
+## this location is Dimension Data specific
+#DISKSPACE=$(df -H | grep '/dev/xvda1' | awk '{ print $5 }' | cut -d'%' -f1)
+DISKSPACE=$(df -H | grep '/dev/mapper/rootvol00-rootlvol00' | awk '{ print $5 }' | cut -d'%' -f1)
+if [ $DISKSPACE -gt "85" ]; then
+	echo -e "Subject: ${HOSTNAME} disk nearly full\r\n\r\nThe disk on the ${HOSTNAME} server is at $DISKSPACE% usage" | sendmail $ALERT_EMAIL
+fi
+
+errCheck () {
+	# check if the previous command returned non 0 exit code and abort
+	if [ $? != 0 ]; then
+		echo !! exited abnormally $1
+		echo -e "Subject: ${HOSTNAME} ERROR\r\n\r\nThe mongo backup on ${HOSTNAME} exited with error message: $1" | sendmail $ALERT_EMAIL
+		exit 1
+	fi
+}
+
+dump_mongo() {
+	#perform a local dump
+	#args: dbname, destination base dir
+    SINGLE_DB=""
+    if [ "$1" != 'all' ]; then
+        # specify single name with --db
+        SINGLE_DB="--db $1"
+    fi
+	mongodump $SINGLE_DB -o $2
+	errCheck "Failed to backup database $1 on server ${HOSTNAME}"
+}
+
+backupMongoDatabase () {
+	mkdir -p $WDIR
+	mkdir -p $TDIR
+	#args: dbname
+	dump_mongo $1 $WDIR
+
+	for i in $WDIR/*; do
+		j=$(basename $i)
+		BACKUP_NAMECOMBO=${HOSTNAME}_${j}
+		BACKUP_DAILY_NAME=${BACKUP_NAMECOMBO}_${DAY}_dom.mongo.tar.gz
+
+		#if daily backup file does not exist or is not younger than 1 day 
+		#overwrites previous backup with same day-of-month name
+		if ! test $(find $TDIR/$BACKUP_DAILY_NAME -mtime -1 2>&1 >/dev/null); then
+			tar zcf $TDIR/$BACKUP_DAILY_NAME -C $WDIR/ ${j}
+
+			# make a local symlink so it works in offsite backup location
+			cd $TDIR
+			ln -sf $BACKUP_DAILY_NAME ${BACKUP_NAMECOMBO}_daily.mongo.tar.gz
+			cd - 2&>/dev/null
+		fi
+
+		# on-demand backup
+		BACKUP_NOW_NAME=${BACKUP_NAMECOMBO}_${CTIME}_od.mongo.tar.gz
+
+		tar zcf $TDIR/$BACKUP_NOW_NAME -C $WDIR/ $j
+
+		cd $TDIR
+		ln -sf $BACKUP_NOW_NAME ${BACKUP_NAMECOMBO}_current.mongo.tar.gz
+		cd - 2&>/dev/null
+
+		# delete 'on-demand' files older than 48 hours
+		find $TDIR/*od.mongo.tar.gz -type f -mtime +2 -exec rm {} \;
+		#find $TDIR/*od.mongo.tar.gz -type f -mmin +2 -exec rm {} \;
+
+	done
+}
+
+backupMongoDatabase $1

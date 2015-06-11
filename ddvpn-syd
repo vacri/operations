@@ -1,0 +1,118 @@
+#!/bin/bash
+# nicked from http://www.heitorlessa.com/connecting-your-linux-to-a-cisco-anyconnect-ssl-part-2/
+# originally an init script, have converted to ask for a user/pass
+# It's a bit rough and takes things on faith. Stick it in /usr/local/bin
+# also, now needs root
+
+#
+# Description: 		Basic script to connect to a SSL VPN using Openconnect
+#
+# Info: 	   		Created by Heitor Lessa - 22/04/2013
+# 							www.heitorlessa.com
+#
+
+# Path variables
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# VPN Variables
+#IFACE="sslinterface"
+#VPN_USER="your_user"
+VPN_HOST="au1.cloud-vpn.net"
+VPN_NAME="DimData VPN"
+#VPN_PASS="your_pass"
+PID="/var/run/openconnect.pid"
+TEMP_LOG="/tmp/openconnect_status.log"
+PROGNAME="$(basename $0)"
+INFO="
+Usage: $PROGNAME (start|stop|status|restart)
+"
+
+if [[ $EUID -ne 0 ]]; then
+    echo "'$PROGNAME' needs to be run as root/sudo. Aborting."
+    exit 1
+fi
+
+# Connect to Cisco SSL VPN using passwords from stdin (passed by VPN_PASS variable created prior)
+function connect_vpn(){
+
+if [ -f $PID ]
+	then
+		printf "\nOpenconnect is already running\n"
+		exit 1
+	else
+        echo -e "$VPN_NAME username: \c"
+        read -r VPN_USER
+        echo -e "$VPN_NAME password: \c"
+        read -r -s VPN_PASS
+
+		#echo ${VPN_PASS} | openconnect -b --interface=${IFACE} --user=${VPN_USER} --no-dtls ${VPN_HOST} --passwd-on-stdin > $TEMP_LOG 2>&1
+		echo ${VPN_PASS} | openconnect -b --user=${VPN_USER} --no-dtls ${VPN_HOST} --passwd-on-stdin > $TEMP_LOG 2>&1
+        if [ "$?" != 0 ]; then
+            echo -e "\nOpenconnect failed to start... (wrong user or pass?)"
+            exit 3
+        fi
+		if $(grep -i failed $TEMP_LOG)
+			then
+				printf "\nOpenconnect failed to start!\n"
+				cat $TEMP_LOG
+				exit 2
+			else
+				touch $PID
+				printf "\nOpenconnect started!\n"
+		fi
+fi
+}
+
+# Check if openconnect is running through PID file
+function check_openconnect(){
+
+if [ -f $PID ]
+	then
+		printf "\nOpenconnect is running!\n"
+	else
+		printf "\nOpenconnect is stopped\n"
+fi
+}
+
+# Confirm if PID file exists, then kill it immediately
+function kill_openconnect(){
+
+if [ -f $PID ]
+	then
+        echo "Killing Openconnect..."
+		rm -f $PID >/dev/null 2>&1
+		kill -9 $(pgrep openconnect) >/dev/null 2>&1
+	else
+		printf "\nOpenconnect is not running!\n"
+fi
+}
+
+case "$1" in
+
+	start)
+
+		connect_vpn
+		;;
+
+	stop)
+
+		kill_openconnect
+		;;
+
+	status)
+
+		check_openconnect
+		;;
+
+	restart)
+
+		$0 stop
+		$0 start
+		;;
+
+	*)
+
+		echo "$INFO"
+		exit 0
+		;;
+esac

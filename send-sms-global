@@ -1,0 +1,117 @@
+#!/usr/bin/perl
+#
+# Send SMS messages from Nagios
+# modified to use SMS Global, sourced from
+# http://www.anchor.com.au/hosting/dedicated/Nagios_notification_options
+#
+
+use strict;
+use warnings;
+
+# You might need to install extra packages to use these modules
+# CPAN is one option, though OS packages might be more convenient
+# Under Debian, you'll need at least libwww-perl and libcrypt-ssleay-perl
+use LWP::UserAgent;
+use Crypt::SSLeay;
+use Getopt::Long;
+
+my $smsglobal_user = "CHANGEME";
+my $smsglobal_pass = "CHANGEME";
+#$smsglobal_pass = "MANGLED";
+my $smsglobal_from = "CHANGEME"; # 11 char maximum for SMS Global
+
+my $number;
+my $message;
+my $test = 0;
+if (!GetOptions('number=s' => \$number,
+                'message=s' => \$message,
+                'test:i' => \$test,
+                'help' => sub { usage(); exit 0; }
+               )) {
+  exit 1;
+}
+
+sub get_date {
+  (my $sec, my $min, my $hour, my $mday, my $mon, my $year, my $wday, my $yday, my $isdst) = localtime(time());
+  return sprintf("%02d:%02d %02d/%02d:", $hour, $min, $mday, $mon + 1, );
+}
+
+sub usage {
+  print "--message (-m) 'Your message, must be in quotes'\n";
+  print "--number (-n) 614XXXXXXXX  (need not be Australia (61))\n";
+  print "--test (-t) 0|1  (optional, 1 = test mode)\n\n";
+  print "Return codes reflect a mix of SMS Global API codes and HTTP error codes.\n";
+  print "Return codes will be mod 256, so a 500 SSL timeout will return '244'\n";
+}
+
+my $send_sms;
+$send_sms = sub {
+  my $sub_number = shift;
+  my $sub_message = shift;
+  my $sub_test = shift;
+
+  my $ua = LWP::UserAgent->new(env_proxy => 1,
+                               keep_alive => 1,
+                               timeout => 20,
+                              );
+  my $url = "https://www.smsglobal.com/http-api.php?action=sendsms&user=$smsglobal_user&password=$smsglobal_pass&from=$smsglobal_from&to=$sub_number&text=$sub_message";
+
+  if ($sub_test == 1){
+	print "Would have sent: $url\n";
+	return 0;
+  }
+
+  # Send the SMS request
+  my $resp = $ua->post($url);
+
+  # Response code and diagnostic output is passed as a single string output from the page
+  my $response = $resp->content;
+
+  # sample responses for testing - might want to comment out 'my $resp' and 'my $response' above
+  #my $test1 = "OK: 0; Sent queued message ID: 89d8d8f475a6b259 SMSGlobalMsgID:6773026752135813";
+  #my $test2 = "ERROR: 11 SMSGlobalMsgID:";
+  #my $test3 = "ERROR: 402";
+  #my $test4 = "500 SSL read timeout:";
+  #my $test5 = "garbage response with no numbers";
+  #my $response = $test5;
+
+  # take first word with numbers, strip non-numerics
+  my $retval;
+  if ( $response =~ /(\d+)/ ) {
+	print "$response\n";
+	$retval = $1;
+	#print "retval = $retval\n";
+  } else {
+	print "No [useful] response received\n";
+	$retval = 1;
+	#print "retval = $retval\n";
+  }
+
+#  print "$response\n";
+
+  return $retval;
+};
+
+
+if (!defined($number)) {
+  print "You need to specify a destination number\n\n";
+  usage();
+  exit 1;
+};
+
+if (!defined($message)) {
+  print "You need to specify a message to send \n\n";
+  usage();
+  exit 1;
+};
+
+# Add date in to the message so we know when it was sent (it may get delayed along the way)
+$message = get_date() . " " . $message;
+
+# Truncate the message to 160 characters, we don't want to span two SMSes
+$message = substr($message, 0, 160);
+
+# Send the message
+my $r = &$send_sms($number, $message, $test);
+
+exit($r);

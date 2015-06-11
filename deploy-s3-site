@@ -1,0 +1,308 @@
+#!/bin/bash
+# Deploy static websites from github to s3 buckets
+#
+# The script needs settings for the repo name and the s3 bucket to 'recognise'
+# a repo - search for 'staging vs production' below to find where to configure
+# these, and put an entry in each section (repo name same, bucket different).
+# 'staging' is default, 'production' gets a user prompt
+#
+# Alternatively, the -l arg can be used to bypass 'autodetection' :)
+
+set -e    # fail immediately on error
+#set -x    # debug mode
+
+GIT_BRANCH="master"
+GIT_TAG=""
+REPO=""
+PRODUCTION=""
+TDIR=""
+GIT_PROVIDER="git@bitbucket.org"
+GIT_ALT_PROVIDER="git@github.com"
+GIT_ACCOUNT="CHANGEME" # //bitbucket.org/CHANGEME...
+USE_LOCAL=""
+S3_BUCKET=""
+DRY_RUN=""
+IGNORE_TIMESTAMP=""
+#CACHE_CONTROL="--cache-control max-age=31536000" # 1 year
+CACHE_CONTROL=""
+OVERWRITE=""
+GZIP="yes" # NOT ACTUALLY AN OPTION - to be removed
+GZIP_TEXT_EXTENSIONS=(html css txt)
+GZIP_APP_EXTENSIONS=(js json)
+# bucket customisation is done below
+
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME [-a GIT ACCOUNT] [-b BRANCH OR TAG] [-c CACHE STRING] [-d] \
+    [-i] [-g] [-l] [-o] [-p] [-s S3_BUCKET] REPO
+
+Examples:
+    $PROGNAME REPONAME
+    $PROGNAME -b ops-test -p REPONAME
+    $PROGNAME -l -s S3BUCKETNAME  #'local' must specify destination bucket
+
+Deploys repo REPO to AWS S3, intended for static sites. $PROGNAME does not
+apply public-read ACLs; instead the bucket must have a bucket policy to allow
+public access.  If no branch or tag are supplied, the master branch will be
+sent to the staging location.
+
+The following file extensions are gzipped in the upload process: ${GZIP_TEXT_EXTENSIONS[@]} ${GZIP_APP_EXTENSIONS[@]}
+
+The script defaults to the $GIT_PROVIDER/$GIT_ACCOUNT collection of repos. These can be
+changed with the -g and -a flags.
+
+ NOTE:
+    Copying to the holding directory creates new timestamps, which counts
+    as different files for the s3 sync, so they will ALL be re-uploaded. This
+    is a limitation in git, which has no mechanism for preserving timestamps.
+
+    To avoid this, use '-i' to copy by diffing only by file size.  The drawback
+    to '-i' is that if the files are the same size, they won't get replaced
+    (eg: config file changes that keep same number of characters).
+
+    Copying from a local repo instead of github/bitbucket should preserve the
+    timestamps, relative to your local repo.
+
+Options:
+ -a     repository account (default to '$GIT_ACCOUNT')
+ -b     git branch or tag to push (defaults to master)
+ -c     'cache-control' string (defaults to "${CACHE_CONTROL}")
+          - must be full string, eg '--cache-control max-age=31536000' (1 year)
+ -d     dry run, simulate s3 push
+ -i     ignore timestamp evaluation for sync (speeds up github-based sync)
+            (downside is that it won't update files if size matches)
+ -g     switch git provider to $GIT_ALT_PROVIDER (default is $GIT_PROVIDER)
+            (not required for a recognised repo)
+ -l     copy current (local) directory, don't use remote master
+            (direct copy, ignores branch or tag args)
+            (does not require a repo name)
+ -o     'overwrite' to force changes to files that match (eg for cache changes)
+            (s3 copy to overwrite, followed by a sync to remove extra files)
+ -p     push to production (default is staging)
+ -s     s3 bucket name (required if repo not recognised by scropt)
+
+Requires:
+ - github connectivity
+ - awscli (with s3 rights)
+EOF
+exit 0
+}
+
+# basic bash colours for fun
+RED="\e[31m";GREEN="\e[32m";YELLOW="\e[33m";BLUE="\e[34m";MAG="\e[35m"
+CYAN="\e[36m";GRAY="\e[37m";INV="\e[7m";HC="\e[1m";RHC="\e[21m";RS="\e[0m"
+
+# getopts colon after letter = opt requires an argument (taken as $OPTARG)
+while getopts "a:b:c:dgilops:" option; do
+    case $option in
+        a) GIT_ACCOUNT="$OPTARG";;
+        b) GIT_BRANCH="$OPTARG";;
+        c) CACHE_CONTROL="$OPTARG";;
+        d) DRY_RUN="--dryrun"; echo "S3 sync dry-run engaged";;
+        g) GIT_PROVIDER="$GIT_ALT_PROVIDER";;
+        i) IGNORE_TIMESTAMP="--size-only";;
+        l) USE_LOCAL="yes";;
+        o) OVERWRITE="yes";;
+        p) PRODUCTION="yes";;
+        s) S3_BUCKET="$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$1" -a -z "$USE_LOCAL" ]; then usage; fi
+
+#if [ -z "$CACHE_CONTROL" ]; then
+#    echo "The Cache Control string cannot be empty (the awscli client will balk)"
+#    echo "If you need to push with no cache control, ask for a rewrite :)"
+#    exit 1
+#fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u    # fail on unset variables
+
+cleanup(){
+    #echo "Cleaning up..." # do cleanup here
+    if [ -n "$TDIR" ]; then rm -rf $TDIR ; fi
+}
+
+trap cleanup exit # on any exit
+
+# script goes here
+command -v aws >/dev/null 2>&1 || { echo >&2 "'awscli' is required, but not found ('pip install awscli').  Aborting."; exit 1; }
+if [ -z "$USE_LOCAL" ]; then command -v git >/dev/null 2>&1 || { echo >&2 "'git' is required, but not found. Aborting."; exit 1; }; fi
+
+#set repo name
+if [ -z "$USE_LOCAL" ]; then
+    REPO="$ARG1"
+else
+    #TODO: clean this logic up. It was changed to handle a new repo that didn't start the website at the root
+    #if [ ! -d ./.git ]; then echo "This is not the root of a git repo. Aborting."; exit 2; fi
+    REPO="$(basename $(git rev-parse --show-toplevel))"
+    #if [ $? != 0 ]; then
+    #    echo "We are not in a git repo. Aborting."
+    #    exit 2
+    #fi
+fi
+
+##
+#staging vs production, friendly names also go here
+if [ "$PRODUCTION" == "yes" ]; then
+
+    # PRODUCTION CONFIGURATION
+    case "$REPO" in
+        front|frontest) REPO='REPO'; S3_BUCKET='PROD_BUCKET';;
+        *) if [ -z "$S3_BUCKET" ]; then
+            echo "Unrecognised repo, must specify s3 bucket";
+            usage; exit 3;
+            fi ;;
+    esac
+
+    echo -e "This will push '$RED$HC$REPO:$(git rev-parse --abbrev-ref HEAD)$RS' to it's production location at '$RED${HC}s3://${S3_BUCKET}$RS'"
+    echo "Continue? (y/n)"
+    read PRODCONT
+    case "$PRODCONT" in
+        yes|y|yep|sure) :;;
+        *) echo "Aborting due to lack of user enthusiasm..."; exit 1;;
+    esac
+
+else
+
+    # STAGING CONFIGURATION
+    case "$REPO" in
+        front|frontest) REPO='REPO'; S3_BUCKET='STAG_BUCKET';;
+        *) if [ -z "$S3_BUCKET" ]; then
+            echo "Unrecognised repo, must specify s3 bucket";
+            usage; exit 3;
+            fi ;;
+    esac
+
+fi
+
+#populate temp dir
+#TDIR="$(mktemp -d)" # doesn't seem to work on osx
+TDIR="/tmp/$PROGNAME.$$"
+mkdir "$TDIR"
+
+if [ "$USE_LOCAL" == "yes" ]; then
+    echo "Copying local repo (branch '$(git rev-parse --abbrev-ref HEAD)') to holding directory..."
+    cp -p -R . $TDIR
+    rm -rf $TDIR/.git*
+else
+    echo "Copying repo ${REPO}:${GIT_BRANCH} from ${GIT_PROVIDER} to holding directory..."
+    git clone --branch $GIT_BRANCH --depth=1 ${GIT_PROVIDER}:${GIT_ACCOUNT}/${REPO}.git $TDIR
+    rm -rf $TDIR/.git*
+fi
+
+
+
+if [ "$OVERWRITE" == "yes" ]; then
+    GZIP_S3_COMMAND="cp --recursive"
+else
+    GZIP_S3_COMMAND="sync --delete"
+fi
+
+#gzipping isn't optional anymore as there's a problem with quoting variables in an array that can be passed through to a cli command without expanding a related shell glob
+if [ "$GZIP" == "yes" ];then
+    cd $TDIR
+
+    #GZIP_TEXT_FILES=
+    #GZIP_APP_FILES=
+    #GZIPPED_FILES=
+    for i in ${GZIP_TEXT_EXTENSIONS[@]}; do
+        IFS="$(printf '\n\t')"      # spaces in names and bash arrays... suck
+        GZIP_TEXT_FILES=($(find ./ -type f -name "*$i" -exec grep -Il . {} \; | sort))
+        if [ "${#GZIP_TEXT_FILES[@]}" -eq 0 ]; then
+            continue
+        fi
+        #EXCLUDED_GZIP_FILES=("${EXCLUDED_GZIP_FILES[@]}" "--exclude \*$i")
+        #echo "EGF = ${EXCLUDED_GZIP_FILES[@]}"
+        echo "gzipping $i files..."
+
+        for j in "${GZIP_TEXT_FILES[@]}"; do
+            gzip -9 "$j"
+            #rename 's/\.gz$//' ${j}.gz
+            mv "${j}.gz" "${j/.gz/}"
+        done
+        unset IFS     # unset here, otherwise aws command breaks
+
+        echo "uploading $i files..."
+        if [ "$i" == "txt" ]; then
+            CTYPE="plain"  #plain text is a unique snowflake...
+        else
+            CTYPE="$i"
+        fi
+        aws s3 $GZIP_S3_COMMAND $DRY_RUN $IGNORE_TIMESTAMP \
+            $CACHE_CONTROL \
+            --content-type "text/$CTYPE" \
+            --content-encoding "gzip" \
+            --exclude '*' \
+            --include "*${i}"\
+            $TDIR \
+            s3://$S3_BUCKET
+            # acl removed, as using bucket policy to allow public read instead
+            # --acl public-read \
+    done
+
+    for i in ${GZIP_APP_EXTENSIONS[@]}; do
+        IFS="$(printf '\n\t')"      # spaces in names and bash arrays... suck
+        GZIP_APP_FILES=($(find ./ -type f -name "*$i" -exec grep -Il . {} \; | sort))
+        if [ "${#GZIP_APP_FILES[@]}" -eq 0 ]; then
+            continue
+        fi
+        #EXCLUDED_GZIP_FILES=("${EXCLUDED_GZIP_FILES[@]}" "--exclude \*$i")
+        echo "gzipping $i files..."
+        for j in "${GZIP_APP_FILES[@]}"; do
+            gzip -9 "$j"
+            #rename 's/\.gz$//' ${j}.gz
+            mv "${j}.gz" "${j/.gz/}"
+        done
+        unset IFS     # unset here, otherwise aws command breaks
+
+        echo "uploading $i files..."
+        if [ "$i" == "js" ]; then
+            CTYPE="javascript"  #javascript is a unique snowflake...
+        else
+            CTYPE="$i"
+        fi
+        aws s3 $GZIP_S3_COMMAND $DRY_RUN $IGNORE_TIMESTAMP \
+            $CACHE_CONTROL \
+            --content-type "application/$CTYPE" \
+            --content-encoding "gzip" \
+            --exclude '*' \
+            --include "*${i}"\
+            $TDIR \
+            s3://$S3_BUCKET
+            # acl removed, as using bucket policy to allow public read instead
+            # --acl public-read \
+
+    done
+    #echo "gzf = '${GZIPPED_FILES[@]}'"
+
+    cd - > /dev/null
+fi
+
+# cd is not functionally necessary, but makes the output of awscli match up with same in the gzip section (and hides the name of the tempdir)
+cd $TDIR
+
+# overwrite existing files if requested
+if [ "$OVERWRITE" == "yes" ]; then
+    echo "Copying/overwriting non-gzipped files to S3 bucket ${S3_BUCKET}..."
+    aws s3 cp --recursive $DRY_RUN $CACHE_CONTROL --exclude '*html' --exclude '*css' --exclude '*txt' --exclude '*js' --exclude '*json' --exclude '.git*' $TDIR s3://$S3_BUCKET
+    echo "Will now follow with a sync to remove any leftover files..."
+fi
+
+# main sync command
+echo "Syncing non-gzipped files to S3 bucket ${S3_BUCKET} and cleaning leftover files..."
+aws s3 sync $DRY_RUN $IGNORE_TIMESTAMP $CACHE_CONTROL --exclude '*html' --exclude '*css' --exclude '*txt' --exclude '*js' --exclude '*json' --exclude '.git*' --delete $TDIR s3://$S3_BUCKET
+
+cd - > /dev/null
+
+echo "Done."
+
+exit 0
+

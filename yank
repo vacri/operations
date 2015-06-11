@@ -1,0 +1,459 @@
+#!/usr/bin/env python
+
+from docker import Client
+from socket import gethostname
+from optparse import OptionParser
+import json
+import subprocess
+import sys
+import os
+import getpass
+import httplib, urllib
+
+
+#initial vars
+envfile='/etc/default/EXAMPLE-env' # contains just 'staging', 'prod', etc
+clientfile='/etc/default/EXAMPLE-client' # contains client name
+hc_message={'colour':'yellow',
+                'message':'',
+                'roomName':"CHANGEME",
+                'roomId':'CHANGEME',
+                'token':'CHANGEME'}
+hc_testroom={'colour':'yellow',
+                'message':'',
+                'roomName':"vacri's secret testing room",
+                'roomId':'CHANGEME',
+                'token':'CHANGEME'}
+hostname=gethostname()
+# quick'n'dirty way to avoid unknown setups
+yank_allowed_clients=('skutters', 'blights', 'kungfu')
+try:
+    username=os.getlogin() # gets the username of the tty owner, even through sudo
+except:
+    username=getpass.getuser() # fallback if run in byobu, which breaks the above
+
+
+# python dict
+# TODO: implement 'friendlies' for friendly names
+
+docker_images = {
+    'CHANGME1':{
+        'container_args':{
+            'image':'ACCOUNTNAME/BUIDPLAN', # for dockerhub, but can be any image
+            'command':'CHANGEME',
+            'label':'latest',
+            'ports':{8124:8124},
+            'volumes':['/var/log'], # mounting an internal container log dir
+            'binds':{
+                '/var/log/docker/HOSTDIR': { 'bind':'/var/log/', 'ro': False }
+            },
+            'tty':True,
+        },
+    },
+    'CHANGEME2':{
+        'friendlies':['NOT', 'IMPLEMENTED', 'YET'],
+        'container_args':{
+            'image':'ACCOUNT/BUILDPLAN',
+            'command':'use-client',
+            'ports':{8124:8124},
+            'volumes':['/var/log'],
+            'binds':{
+                '/var/log/docker/HOSTDIR': { 'bind':'/var/log/', 'ro': False }
+            },
+            'tty':True,
+        },
+        'client':{ # 'client' allows differentiation between different client
+            'CLIENT1':{
+                'production':{ # these are all examples
+                    'command':'-c COMMAND -n production',
+                    'suffix':'prod'
+                },
+                'staging':{
+                    'command':'-c COMMAND -n production',
+                    'suffix':'demo'
+                },
+                'testing':{
+                    'command':'-c COMMAND -n production',
+                    'suffix':'demo'
+                },
+                'development':{
+                    'command':'-n COMMAND',
+                    'suffix':'demo'
+                }
+            },
+            'CLIENT2':{
+                'production':{
+                    'command':'-c COMMAND -n production',
+                    'suffix':'skutters'
+                },
+                'staging':{
+                    'command':'-c COMMAND -n production',
+                    'suffix':'skutters'
+                },
+                'testing':{
+                    'command':'-c COMMAND -n production',
+                    'suffix':'skutters'
+                },
+                'development':{
+                    'command':'-n COMMAND',
+                    'suffix':'demo'
+                }
+            }
+        }
+    },
+    'jessie':{
+        'friendlies':['debian','jessie'],
+        'container_args':{
+            'image':'debian',
+            'label':'jessie',
+            'command':'/bin/sleep 20'
+        }
+    }
+}
+
+
+#options
+usage = "usage: %prog [options] LIST OF IMAGES\n\nBy default with no options, will pull a fresh docker image, recreate the container, and restart it.\n\nContainers created by yank are given 'restart = always'. If yank creates a container, it must also start it - the 'restart=always' config is added only in the 'start' api (!?). This is permanent, so a later manual restart shouldn't need to explicitly add it.\n\n%prog required the docker.py library, and should be run with a client and environment specified in /etc/default/client and /etc/default/environment respectively."
+parser = OptionParser(usage=usage)
+parser.add_option("-b", "--bash", dest="bash", help="attach to the container with bash", action="store_true")
+#parser.add_option("-m", "--manual", dest="manual", help="show manual commands", action="store_true")
+parser.add_option("-r", "--restart-only", dest="nopull", help="restart existing container, don't pull the image or recreate the container", action='store_true')
+parser.add_option("-n", "--no-restart", dest="norestart", help="pull image only, do not recreate/restart the container", action="store_true")
+parser.add_option('-m', '--command', dest='command', help='set command for image, overriding any defaults', action='store')
+parser.add_option('-l', '--label', dest='label', help='label for pulled images (overrides autoselection from env; a non-existant label appear to pull latest instead)', action='store', type='string')
+parser.add_option('-s', '--suppress_hipchat', dest='suppress_hipchat', help='suppress notifications to hipchat', action='store_true')
+parser.add_option('-c', '--clean', dest='clean', help='remove dangling images, no effect on containers', action='store_true')
+parser.add_option('-p', '--purge', dest='purge', help='remove ALL NON-RUNNING containers/images', action='store_true')
+parser.add_option('-t', '--testroom', dest='testroom', help="send hipchat message to vacri's testroom", action='store_true')
+parser.add_option('-y', '--yes', '--noninteractive', dest='noninteractive', help = "ignore confirmation prompts", action='store_true')
+(options, args) = parser.parse_args()
+
+if not args and not options.clean and not options.purge:
+    print 'I need arguments! Use -h to see the ones I like...'
+    sys.exit()
+
+# set prod/stag/test env
+try:
+    with open(envfile, 'r') as ef:
+        options.server_env=ef.readline().strip()
+        if options.server_env == 'production':
+            hc_message['colour'] = 'purple'
+        elif options.server_env == 'staging':
+            hc_message['colour'] = 'green'
+        else:
+            hc_message['colour'] = 'yellow'
+            #options.suppress_hipchat = True
+            pass
+except:
+    print "Couldn't open " + envfile + ", does it exist?"
+    options.server_env = None
+    hc_message['colour'] = 'yellow'
+
+# set client
+try:
+    if os.stat(clientfile).st_size > 0:
+        with open(clientfile, 'r') as cf:
+            options.client=cf.readline().strip()
+            if options.client not in yank_allowed_clients:
+                print "unknown client '" + options.client + "' in client file", clientfile, ", ignoring..."
+                options.client = None
+    else:
+        print "Client file empty..."
+        options.client = None
+except:
+    print "Client file '" + clientfile + "' not detected..."
+    options.client = None
+
+if not options.server_env:
+    options.server_env = 'development'
+    print "\033[93mUsing default env '" + options.server_env + "'...\033[0m"
+if not options.client:
+    options.client = 'DEFAULTCLIENT'
+    print "\033[93mUsing default client '" + options.client + "'...\033[0m"
+
+
+#debug options
+#print "DEBUG: args =", args
+#print "DEBUG: nopull = ", options.nopull
+#print "DEBUG: server env =", options.server_env
+#print "DEBUG: norestart =", options.norestart
+#print "DEBUG: purge =", options.purge
+#print "DEBUG: suppress =", options.suppress_hipchat
+#print "DEBUG: image =", image
+#print "DEBUG: name =", name
+
+def pull_image(image):
+
+    sys.stdout.write("Pulling image '" + image + "'...\033[90m")
+    for line in d.pull(image, stream = True):
+        sys.stdout.flush()
+        state = json.loads(line)
+
+        rows, columns = [int(x) for x in os.popen('stty size', 'r').read().split()] # get tty width
+
+        # the above line in javascript :)
+        #var out = os.popen('stty size', 'r').read().split();
+        #for(var i=0; i <= out.length; i++) {
+        #    if(i === 0) var rows = Number(out[0]);
+        #    if(i === 1) var columns = Number(out[1]);
+        #}
+
+
+        status_line = state['status']
+        if 'id' in state:
+            status_line += ' ' + state['id']
+        if 'progress' in state:
+            status_line = '\r' + status_line
+            status_line += ' ' + state['progress'] + '\033[K' # [K = 'clear to end of line', clearing out chars from longer previous lines
+        else:
+            status_line = '\n' + status_line
+        sys.stdout.write(status_line[0:columns])
+    sys.stdout.write('\n\033[0m... finished image pull\n')
+    sys.stdout.flush()
+
+def stop_container(name):
+    print "Stopping container '" + name + "'..."
+    #check running containers
+    if '/' + name in [n['Names'][0] for n in d.containers()]: # .containers() returns names prepended with /
+        d.stop(name)
+    else:
+        print "... no running container '" + name + "' to stop"
+
+def delete_container(name):
+    print "Deleting container '" + name + "'..."
+    #check all containers, running or stopped
+    if '/' + name in [n['Names'][0] for n in d.containers(all=True)]:  # .containers() returns names prepended with /
+        d.remove_container(container=name)
+    else:
+        print "... no container '" + name + "' to delete"
+
+def create_container(cconf):
+    print "Creating new container '" + cconf['name'] + "' from image '" + cconf['image'] + "'..."
+
+    create_args = {}
+
+    for i in ('image', 'name', 'command', 'volumes', 'ports', 'tty'):
+        if i in cconf:
+            create_args[i] = cconf[i]
+
+    if 'image' in cconf and 'label' in cconf:  # this if a little redundant - there must always be a label or docker.py will pull ALL images
+        create_args['image'] = cconf['image'] + ':' + cconf['label']
+
+    if 'ports' in cconf:
+        create_args['ports'] = []
+        for key in cconf['ports']:
+            create_args['ports'].append(key)
+
+    #print "DEBUG: container conf =", cconf
+    #print "DEBUG: create_args =", create_args
+
+    contId = d.create_container(**create_args)
+
+    print "... with container id", contId['Id'][0:12]
+    hc_message['message'] = hc_message['message'] + "<li>container <b>" + cconf['name'] + "</b> was rebuilt with id <b>" + contId['Id'][0:12] + "</b></li>"
+
+def start_container(cconf):
+    print "Starting container '" + cconf['name'] + "'..."
+    # yank is only meant for perma-restarting containers, so all containers get the 'restart always' option
+    ports = {}
+    if 'ports' in cconf:
+        ports.update(**cconf['ports'])
+        #print "DEBUG: ports =", ports
+
+    volume_binds = {}
+    if 'binds' in cconf:
+        volume_binds.update(**cconf['binds'])
+        #print "DEBUG: binds =", volume_binds
+
+    response = d.start(cconf['name'], binds=volume_binds, port_bindings=ports, restart_policy = { 'MaximumRetryCount':'0', 'Name':'always' })
+    if response:
+        print "Docker had an issue starting the container: '" + response + "'"
+    hc_message['message'] = hc_message['message'] + "<li>container <b>" + cconf['name'] + "</b> was [re]started</li>"
+
+def notify_hipchat(hc_message):
+    if not options.suppress_hipchat:
+
+
+        params=urllib.urlencode({'color': hc_message['colour'], 'message_format': 'html', 'message': hc_message['message'] })
+        context='/v2/room/' + hc_message['roomId'] + '/notification?auth_token=' + hc_message['token']
+        headers= {"Content-type": "application/x-www-form-urlencoded"}
+
+        #print params, context
+
+        hipchat_conn = httplib.HTTPSConnection('api.hipchat.com')
+        hipchat_conn.request('POST', context, params, headers)
+        response = hipchat_conn.getresponse()
+        #print "DEBUG: Hipchat sez:", response.status, response.reason
+
+    else:
+        print "Suppressing hipchat notification..."
+
+def bash_container(name):
+    print "Entering '" + name + "' with bash..."
+    subprocess.call(["docker", "exec", "-ti", name, "bash"])
+    sys.exit()
+
+def clean_images():
+    print "Cleaning up dangling images..."
+    # docker.py API doesn't seem to have this 'dangling' functionality
+    dangling_images = subprocess.check_output(['docker', 'images', '-q', '--filter="dangling=true"']).splitlines()
+    #print "DEBUG: Dangling = ", dangling_images
+    for i in dangling_images:
+        # force required or an error is generated if an old container references the untagged image
+        d.remove_image(i, force = True)
+    print "Clean complete"
+
+def purge_docker():
+    purgeconfirm = ""
+    if not options.noninteractive:
+        purgeconfirm = raw_input("\033[1;31mPurge ALL non-running containers and images?\033[0m (y/n)\n  (You may want to try a 'clean' first)")
+    if purgeconfirm in ('y', 'yes', 'rockin') or options.noninteractive == True:
+        print "Purging all containers..."
+        for i in d.containers( all = True ):
+            try:
+                d.remove_container(i)
+            except:
+                print "...container '" + i['Names'][0].lstrip('/') + "' not removed (running?)"
+        print "Purging all images..."
+        # should not require 'all = True' as docker should delete interstitial images automatically
+        for i in d.images():
+            try:
+                d.remove_image(i)
+            except:
+                if i['RepoTags']:
+                    skipped_image = i['RepoTags'][0]
+                else:
+                    skipped_image = i['Id'][0:12]
+                print "...image '" + skipped_image + "' not removed (running?)"
+        print "Purge complete"
+    else:
+        print "Aborting purge due to unenthusiastic user..."
+
+
+# connect to docker, assumed working .dockercfg
+d = Client(base_url='unix://var/run/docker.sock')
+
+hc_message['message'] = ""
+
+if options.purge:
+    purge_docker()
+    sys.exit()
+
+if options.clean:
+    clean_images()
+    sys.exit()
+
+
+if options.testroom:
+    hc_message.update(hc_testroom)
+
+
+for arg in args:
+
+    # set up container creation parameters
+    cconf = {}
+
+    if arg in docker_images:
+
+        # seed the container args
+        cconf = docker_images[arg]['container_args']
+        try:
+            if docker_images[arg]['container_args']['command'] == 'use-client':
+                cconf['command'] = docker_images[arg]['client'][options.client][options.server_env]['command']
+                cconf['name'] = arg + '-' + options.client + '-' + docker_images[arg]['client'][options.client][options.server_env]['suffix']
+                if options.label:
+                    docker_images[arg]['client'][options.client][options.server_env]['label'] = options.label
+                if 'label' in docker_images[arg]['client'][options.client][options.server_env]:
+                    cconf['label'] = docker_images[arg]['client'][options.client][options.server_env]['label']
+            else:
+                cconf['command'] = docker_images[arg]['container_args']['command']
+                if options.label:
+                    docker_images[arg]['container_args']['label'] = options.label # overwrite with user-specified label
+                try:
+                    if docker_images[arg]['container_args']['suffix'] is not None:
+                        cconf['name'] = arg + '-' + docker_images[arg]['container_args']['suffix']
+                    else:
+                        cconf['name'] = arg + '-default'
+                except:
+                    cconf['name'] = arg + '-default'
+
+        except KeyError:
+            #print "DEBUG: cconf =", cconf
+            #print "DEBUG: orig = ", docker_images[arg]['container_args']['command']
+            print "Missing 'command' for container (probably), aborting..."  # TODO: a default command?
+            sys.exit(2)
+
+    else:
+
+        print "Unrecognised image '" + arg + "', no preset config available"
+
+        if options.bash:
+            print "Trying '" + arg + "' anyway..."
+            bash_container(arg)
+
+        if not options.noninteractive:
+            use_anyway = raw_input("Try to use '" + arg + "' anyway? (y/n)")
+            if use_anyway in ('y', 'yes', 'rockin'):
+                if not options.command:
+                    print "You also need to specify a command (with '-m'). Aborting..."
+                    sys.exit(3)
+
+                cconf['image'] = os.path.basename(arg).split(':')[0]
+                if not options.label:
+                    cconf['label'] = 'latest'
+
+                cconf['name'] = cconf['image'] + '-' + cconf['label']
+
+
+                #if arg.startswith('mystery_'): # ie: already exists
+                #    cconf['name'] = cconf['image']
+                #else:
+                #    cconf['name'] = 'mystery_' + cconf['image']
+            else:
+                print "Aborting due to unenthusiastic user"
+                sys.exit()
+        else:
+            print 'Aborting...'
+            sys.exit(1)
+
+    # after all of the above, overwrite the command if one is specified
+    if options.command:
+        cconf['command']=options.command
+
+    if options.bash:
+        bash_container(cconf['name'])
+
+    if not options.nopull:
+        if not 'label' in cconf:
+            cconf['label'] = 'latest' # python bindings pull ALL tagged images if no label specified!
+
+        pulltarget = cconf['image'] + ':' + cconf['label']
+
+        pull_image(pulltarget)
+
+        hc_message['message'] = hc_message['message'] + "\n<b>" + \
+            pulltarget + "</b> on <b>" + hostname + \
+            "</b> has been pulled by <b>" + username + "</b><ul>"
+
+
+    else:
+        print "skipping image pull..."
+        #print 'DEBUG:', hc_message
+        hc_message['message'] = hc_message['message'] + "\n<b>" + username + \
+            "</b> has been fiddling with <b>" + cconf['image'] + \
+            "</b> on <b>" + hostname + "</b><ul>"
+
+    if not options.norestart:
+        stop_container(cconf['name'])
+        if not options.nopull:
+            delete_container(cconf['name'])
+            create_container(cconf)
+        start_container(cconf)
+
+    hc_message['message'] = hc_message['message'] + "</ul>"
+
+# suppress 'pull only' notifications, because they're spammy
+if not options.norestart:
+    notify_hipchat(hc_message)
+
+print "Done."
