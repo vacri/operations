@@ -6,6 +6,7 @@ All scripts are non-destructive when run without any arguments (and usually give
 As most of these scripts are sanitised, there are some variables at the start that will need customisation (usually a placeholder in capitals will indicated required vars)
 
 | thing | function |
+| -- | -- |
 | archive-gmail     | get a zipped .mbox of your gmail |
 | bash.boilerplate  | boilerplate for bash scripts |
 | check-elasticsearch | nagios check for ElasticSearch status |
