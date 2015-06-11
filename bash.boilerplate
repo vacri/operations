@@ -20,10 +20,11 @@ exit 0
 # basic bash colours for fun
 RED="\e[31m";GREEN="\e[32m";YELLOW="\e[33m";BLUE="\e[34m";MAG="\e[35m"
 CYAN="\e[36m";GRAY="\e[37m";INV="\e[7m";HC="\e[1m";RHC="\e[21m";RS="\e[0m"
+DGRAY="\e[90m"
 
 # getopts colon after letter = opt requires an argument (taken as $OPTARG)
 while getopts "ab:" option; do
-    case $option in 
+    case $option in
         a) VAR="foo";;
         b) VAR2="$OPTARG";;
     esac
@@ -53,3 +54,4 @@ trap alert ERR    # on an error (though can't pass any information about error)
                   # looks like 'trap ERR' doesn't play nicely with 'set -e'
 
 # script goes here
+

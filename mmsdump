@@ -1,0 +1,114 @@
+#!/bin/bash
+# Boilerplate for bash scripts
+# NOTE: positional args are converted from $1 to $ARG1 for use with 'set -u'
+# replace this bit with a sysadmin desc of script
+
+set -e    # fail immediately on error
+#set -x    # debug mode
+set -o pipefail
+
+HOST=""
+PORT=""
+USER=""
+PASS=""
+DATABASE=""
+
+
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME -h HOST -p PORT -u USER -s SECRET/PASS DATABASE
+
+$PROGNAME is a wrapper for mongodump which excludes the 'system' collections,
+as an MMS-managed Mongo version does not allow you to create a user that can
+access these collections, which causes mongodump to fail.
+
+Basically $PROGNAME interrogates the indicated database for its collections,
+then builds a mongo command to dump them individually, except for 'system.*'.
+This is because mongo 2.x must individually specify each collection if dumping
+a partial database. 3.0 brings in the ability to exclude collections - a
+shorter process, but probably still worth a wrapper when we use 3.0 :)
+
+Of course, this will create a dump without the system tabls (usually
+system.users, system.indexes)
+
+EOF
+exit 0
+}
+
+# basic bash colours for fun
+RED="\e[31m";GREEN="\e[32m";YELLOW="\e[33m";BLUE="\e[34m";MAG="\e[35m"
+CYAN="\e[36m";GRAY="\e[37m";INV="\e[7m";HC="\e[1m";RHC="\e[21m";RS="\e[0m"
+DGRAY="\e[90m"
+
+# getopts colon after letter = opt requires an argument (taken as $OPTARG)
+while getopts "h:p:s:u:" option; do
+    case $option in
+        h) HOST="$OPTARG";;
+        p) PORT="$OPTARG";;
+        s) PASS="$OPTARG";;
+        u) USER="$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$1" ]; then usage; fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u    # fail on unset variables
+
+cleanup(){
+    #echo "Cleaning up..." # do cleanup here
+    :
+}
+
+alert(){
+    #echo "Alert! Errorb!" # don't do cleanup here
+    :
+}
+
+trap cleanup exit # on any exit
+trap alert ERR    # on an error (though can't pass any information about error)
+                  # looks like 'trap ERR' doesn't play nicely with 'set -e'
+
+# script goes here
+DATABASE=$ARG1
+
+echo "Fetching collection list for database '$DATABASE'..."
+IFS=','
+COLLECTIONS=( $( mongo --host $HOST --port $PORT -u $USER  -p $PASS $DATABASE --eval "db.getCollectionNames()" | tail -n 1) ) 
+unset IFS
+
+# remove any 'system.*' collection (system.users, system.indexes)
+echo "Stripping 'system.*' from collections list..."
+for i in ${!COLLECTIONS[@]}; do # ! = iterated keys/indexes, not values
+    if [[ "${COLLECTIONS[$i]}" =~ ^system* ]]; then
+        COLLECTIONS[$i]=''
+    fi
+done
+
+#echo "Collections = ${COLLECTIONS[@]}"
+
+# build collections to be included
+#INCLUSIONS=""
+#for i in ${COLLECTIONS[@]}; do
+#    INCLUSIONS="$INCLUSIONS --collection $i"
+#done
+
+#echo "Inclusions = $INCLUSIONS"
+
+# dumptime!
+#mongodump --host "$HOST" --port "$PORT" -u "$USER" -p "$PASS" "$INCLUSIONS" -db "$DATABASE"
+
+# each collection must be dumped individually in mongo 2.x - can't do multiples
+# and can't exclude collections...
+for c in ${COLLECTIONS[@]}; do
+    echo -e "${RS}Dumping collection $c from ${DATABASE}...$DGRAY"
+    mongodump --host "$HOST" --port "$PORT" -u "$USER" -p "$PASS" -c "$c" -db "$DATABASE"
+done
+
+echo -e "${RS}Done"

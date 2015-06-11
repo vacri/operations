@@ -19,7 +19,7 @@ Usage:
 To restore from the backup, use the native restore command:
 
     mongorestore -d [database name] [--drop] --objcheck [-w 3] [directory with extracted db backup]
-    mongorestore -d kpmg_com_au --drop --objcheck -w 3 kpmg_com_au/
+    mongorestore -d testdb --drop --objcheck -w 3 testdb/
 
   --drop destroys the existing database
   --objcheck validates all objects being inserted

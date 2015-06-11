@@ -1,0 +1,119 @@
+#!/bin/bash
+# mercilessly ripped off the 'mygrants' answer at 
+# http://serverfault.com/questions/8860/how-can-i-export-the-privileges-from-mysql-and-then-import-to-a-new-server
+
+set -e    # fail immediately on error
+#set -x    # debug mode
+set -o pipefail
+
+MYSQL_HOST='--host=localhost'
+MYSQL_PORT='--port=3306'
+TABLE_DUMP=""
+USER_DUMP=""
+LIMIT_USER="tee" # pipe 'do nothing' placeholder
+MYSQL_USER=""
+MYSQL_PASS=""
+MYSQL_DATABASE=""
+
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME [-h HOST] [-P PORT] [-u USER] [-p PASSWORD] \\ 
+        [-m / -l TABLE USER] [-d DATABASE]
+
+    $PROGNAME -h localhost -u root -p ABC -m -l magicdude > grants.sql
+    $PROGNAME -h localhost -u foo -p bar -d magicdb > schema.sql
+    $PROGNAME [OPTIONS] | mysql [destination import options]
+
+$PROGNAME pulls things that aren't data from MySQL - user grants or table
+structures - and throws them at STDOUT. The output should be clean mysql and
+can be piped into an import process, if you like.
+
+NOTE: The user grant info does not show how to *create* the user - 
+that's in MySQL 5.7.6
+
+Dump options
+
+    -d dump table structure, but no data from this db
+       - overrides -m request
+    -m dump mysql users
+       - uses the mysql.user table
+       - requires an admin user
+       - don't use '-d' arg
+    -l limit -m to a specified user
+
+Connection options, asterisks mandatory
+
+    -h host (default $MYSQL_HOST)
+    -P port (default $MYSQL_PORT) (capital P)
+    -u mysql user
+    -p mysql password
+
+EOF
+exit 0
+}
+
+# basic bash colours for fun
+RED="\e[31m";GREEN="\e[32m";YELLOW="\e[33m";BLUE="\e[34m";MAG="\e[35m"
+CYAN="\e[36m";GRAY="\e[37m";INV="\e[7m";HC="\e[1m";RHC="\e[21m";RS="\e[0m"
+
+# getopts colon after letter = opt requires an argument (taken as $OPTARG)
+while getopts "h:u:p:d:ml:" option; do
+    case $option in
+        d) MYSQL_DATABASE="$OPTARG";;
+        m) USER_DUMP="yes";;
+        l) LIMIT_USER="grep $OPTARG";;
+        h) MYSQL_HOST="--host=$OPTARG";;
+        u) MYSQL_USER="--user=$OPTARG";;
+        P) MYSQL_PORT="--port=$OPTARG";;
+        p) MYSQL_PASS="--password=$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$MYSQL_DATABASE" ] && [ -z "$USER_DUMP" ]; then echo "ERROR: no dumptype selected (-d/-m)"; usage; fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u    # fail on unset variables
+
+cleanup(){
+    #echo "Cleaning up..." # do cleanup here
+    :
+}
+
+alert(){
+    #echo "Alert! Errorb!" # don't do cleanup here
+    :
+}
+
+trap cleanup exit # on any exit
+trap alert ERR    # on an error (though can't pass any information about error)
+                  # looks like 'trap ERR' doesn't play nicely with 'set -e'
+
+# script goes here
+
+mygrants(){
+  mysql -B -N $MYSQL_HOST $MYSQL_PORT $MYSQL_USER $MYSQL_PASS -e "SELECT DISTINCT CONCAT(
+    'SHOW GRANTS FOR \'', user, '\'@\'', host, '\';'
+    ) AS query FROM mysql.user" | \
+  mysql $MYSQL_HOST $MYSQL_PORT $MYSQL_USER $MYSQL_PASS | $LIMIT_USER | \
+  sed 's/\(GRANT .*\)/\1;/;s/^\(Grants for .*\)/## \1 ##/;/##/{x;p;x;}'
+}
+
+tabledump(){
+    mysqldump --no-data $MYSQL_HOST $MYSQL_PORT $MYSQL_USER $MYSQL_PASS $MYSQL_DATABASE
+}
+
+if [ -n "$MYSQL_DATABASE" ]; then
+    tabledump
+else
+    if [ -n "$USER_DUMP" ]; then
+        mygrants
+    fi
+fi
+
+

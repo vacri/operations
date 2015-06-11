@@ -1,0 +1,315 @@
+#!/usr/bin/env python
+
+# Yeah, this is ugly and wrong. Don't look.
+
+# Script to copy table with non-changing data to new mysql database
+# - finds current number of rows in target database, compares to source
+# - takes N new rows from source and slaps them in target
+# - assumes existing rows never change
+#
+# This script is intended to be used in the migration of a 1.4B line
+# YOURLS database table, keeping the new location up-to-date. The table
+# rows never change - basically this is an append-row-slurper, intended
+# to keep downtime during a production migration down
+#
+# TODO: use one db connection per endpoint, rather than remake the connection
+# for every sql command...
+
+import MySQLdb as mdb
+import MySQLdb.cursors as mdbc
+import argparse
+import getpass
+import sys
+import time
+import textwrap
+import json
+
+
+# uses canned database names, because screw always shoving them on the commandline
+mysql_env = {
+    'staging':{
+        'source_db':{
+            'host':'edairy.cx8u11tpukx4.us-east-1.rds.amazonaws.com',
+            'port':3306,
+            'user':'eqo_readonly',        # use a READONLY user!
+            'password':'wbeuhbkvaakwbv',    # leave this unfilled
+            'database':'e_qos',
+            'table':'yourls_log'
+        },
+        'target_db':{
+            'host':'stagvpc-eqo.cx8u11tpukx4.us-east-1.rds.amazonaws.com',
+            'port':3306,
+            'user':'eqo_user',
+            'password':'',    # leave this unfilled
+            'database':'stagvpc_eqo',
+            'table':'yourls_log'
+        }
+    },
+    'production':{
+        'source_db':{
+            'host':'',
+            'port':3306,
+            'user':'',        # use a READONLY user!
+            'password':'',    # leave this unfilled
+            'database':'',
+            'table':'yourls_log'
+        },
+        'target_db':{
+            'host':'',
+            'port':3306,
+            'user':'',
+            'password':'',    # leave this unfilled
+            'database':'',
+            'table':'yourls_log'
+        }
+    },
+    'testing':{
+        'source_db':{
+            'host':'',
+            'port':3306,
+            'user':'',
+            'password':'',    # leave this unfilled
+            'database':'',
+            'table':'yourls_log'
+        },
+        'target_db':{
+            'host':'',
+            'port':3306,
+            'user':'',
+            'password':'',    # leave this unfilled
+            'database':'',
+            'table':'yourls_log'
+        }
+    }
+}
+
+
+parser = argparse.ArgumentParser(add_help=False,
+    formatter_class=argparse.RawDescriptionHelpFormatter, 
+    description=textwrap.dedent('''\
+        Usage: scriptname env
+               scriptname staging
+               scriptname staging -h SOURCE_HOST -t SOURCE_TABLE
+
+
+        This is a helper script to assist in the migration of a very large MySQL table
+        in a production environment with low downtime. The table in question has 1.4B
+        rows of unchanging data (200GB), and has rows added frequently, but not altered.
+
+        The script takes a count of both source and target database tables, and if
+        there is a difference, takes N rows from the source and inserts to the target
+        table. Ultimately, the bulk of the table will be installed from a backup,
+        with this script used to bring the new table up-to-date.
+
+        Default database settings can be overridden, but the script will always
+        ask for passwords (it won't work on a passwordless database)
+
+        The 'testing' env has no predefined settings, and can be used for a custom
+        copy - but you will need to specify all the details below!
+
+        Requirements:
+        - python module for mysql ('python-mysqldb' in ubuntu)
+        - credentials for both databases
+        - network access to both source and target databases
+
+        Assumptions:
+        - tables match up
+        - existing rows never change values (write-once)
+
+        WARNING: this script was intended to be reusable, but currently is hardcoded
+        and will only work with the 'yourls_log' table in the nominated databases.
+        '''))
+parser.add_argument("env", help="staging, production, testing, etc")
+parser.add_argument("-h", "--host", help="source host")
+parser.add_argument("-p", "--port", help="source port")
+parser.add_argument("-u", "--user", help="source user")
+parser.add_argument("-d", "--db", help="source database")
+parser.add_argument("-t", "--table", help="source table")
+parser.add_argument("-H", "--HOST", help="target host")
+parser.add_argument("-P", "--PORT", help="target port")
+parser.add_argument("-U", "--USER", help="target username")
+parser.add_argument("-D", "--DB", help="target database")
+parser.add_argument("-T", "--TABLE", help="target table")
+parser.add_argument("-s", "--sleep", help="inter-fetch sleep time", type=float, default=0.2)
+parser.add_argument("-r", "--rows", help="number of rows in each fetch", type=int, default=200)
+parser.add_argument("-y", "--yes", help="assume 'yes' to all user prompts", action='store_true')
+try:
+    options = parser.parse_args()
+except:
+    parser.print_help()
+    sys.exit(0)
+
+#print "options are:", options
+
+if options.env in mysql_env:
+
+    sourcedb = mysql_env[options.env]['source_db']
+    if options.host:
+        sourcedb['host'] = options.host
+    if options.port:
+        sourcedb['port'] = options.port
+    if options.user:
+        sourcedb['user'] = options.user
+    if options.db:
+        sourcedb['database'] = options.db
+    if options.table:
+        sourcedb['table'] = options.table
+
+    targetdb = mysql_env[options.env]['target_db']
+    if options.HOST:
+        targetdb['host'] = options.HOST
+    if options.PORT:
+        targetdb['port'] = options.PORT
+    if options.USER:
+        targetdb['user'] = options.USER
+    if options.DB:
+        targetdb['database'] = options.DB
+    if options.TABLE:
+        targetdb['table'] = options.TABLE
+
+else:
+    print "Urecognised env '" + options.env + "', aborting"
+    sys.exit(1)
+
+#print "DEBUG: sourcedb:", sourcedb
+#print "DEBUG: targetdb:", targetdb
+
+def count_rows(database):
+    # arg is the dict of database vars
+
+    #print "DEBUG: counting rows for", database['database']
+
+    db = mdb.connect(host=database['host'],
+        port=database['port'],
+        user=database['user'],
+        passwd=database['password'],
+        db=database['database'],
+        cursorclass = mdbc.SSCursor)
+    cur = db.cursor()
+
+    cur.execute('''SELECT COUNT(*) FROM %s''' % (database['table'],))
+
+    # this assumes success and only one item in cursor! (returned rows)
+    for row in cur:
+        count = row[0]
+
+    cur.close()
+    db.close()
+
+    return count
+
+def fetch_rows(database, offset, return_rows):
+    db = mdb.connect(host=database['host'],
+        port=database['port'],
+        user=database['user'],
+        passwd=database['password'],
+        db=database['database'],
+        cursorclass = mdbc.SSCursor)
+    cur = db.cursor()
+
+    sql = '''SELECT * FROM %s LIMIT %s OFFSET %s''' % (database['table'], return_rows, offset)
+    cur.execute(sql)
+
+    rowdata = cur.fetchall()
+
+    cur.close()
+    db.close()
+
+    return rowdata
+
+
+
+def insert_rows(database, offset, rowdata):
+    db = mdb.connect(host=database['host'],
+        port=database['port'],
+        user=database['user'],
+        passwd=database['password'],
+        db=database['database'],
+        cursorclass = mdbc.SSCursor)
+    cur = db.cursor()
+
+    ## TODO: unneeded while the insert command has hardcoded colnames
+    ## make a tuple of column names
+    #colnames = ()
+    #cur.execute('''SHOW COLUMNS FROM %s''' % (database['table'],))
+    #for i in cur.fetchall():
+    #    colnames = colnames + (i[0],)
+
+    ##print colnames
+    #TODO: make this less hardcoded!
+    #print "DEBUG: rowdata = ", rowdata
+    #sql = '''INSERT INTO %s %s VALUES ''' % (database['table'], colnames)
+    #cur.executemany(sql + '(%s, %s, %s, %s, %s, %s, %s, %s)', rowdata)
+    cur.executemany('''INSERT INTO yourls_log (click_id, click_time, shorturl, referrer, user_agent, ip_address, country_code, reference) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''', rowdata)
+
+    cur.close()
+    db.close()
+
+    return
+
+
+
+def main():
+
+    print "This script will update rows from the SOURCE:"
+    print "           host:", sourcedb['host']
+    print "           user:", sourcedb['user']
+    print "       database:", sourcedb['database']
+    print "          table:", sourcedb['table']
+    print "to the TARGET:"
+    print "           host:", targetdb['host']
+    print "           user:", targetdb['user']
+    print "       database:", targetdb['database']
+    print "          table:", 'yourls_log' #hardcoded at the moment
+    print "by appending any rows above the count in the target db"
+    print
+
+    sourcedb['password'] = getpass.getpass(prompt='Password for source database user: ')
+    targetdb['password'] = getpass.getpass(prompt='Password for target database user: ')
+
+    #print "Source database:", sourcedb
+    #print "Target database:", targetdb
+
+    scount = count_rows(sourcedb)
+    tcount = count_rows(targetdb)
+
+    print "Starting Row Count: source %s target %s" %(scount, tcount)
+
+
+    if scount == tcount:
+        print "Source and target tables have same number of rows"
+        print "This is considered up-to-date"
+    elif scount < tcount:
+        print "There are more rows in the target table"
+        print "Either the target database is live, or someething is Very Wrong"
+        print "Aborting..."
+        sys.exit(2)
+    else:
+        while scount > tcount:
+            return_rows = min(options.rows, scount - tcount)
+            offset = tcount
+
+            #print "DEBUG: return_rows %s, offset %s" % (return_rows, offset)
+            #do stuff
+            print "Fetching %s rows from offset %s..." % (return_rows, offset)
+            rowdata = fetch_rows(sourcedb, offset, return_rows)
+
+            print "Inserting %s rows from offset %s... chunka chunka chunka..." % (return_rows, offset)
+            insert_rows(targetdb, offset, rowdata)
+
+
+            tcount = count_rows(targetdb)
+            if tcount == scount:
+                print "Number of rows in source and destination databases match!"
+                print "Apparently we're done."
+                break
+
+            time.sleep(options.sleep)
+
+
+    print "Done."
+
+main()
+
+
+sys.exit(0)
