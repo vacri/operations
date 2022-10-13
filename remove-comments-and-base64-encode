@@ -1,0 +1,6 @@
+#!/bin/bash
+
+if [ -z "$1" ]; then echo "Usage: supply a text file as the first arg, get a base64 encoded string with #comments removed"; exit 1; fi
+
+# does not remove #!/bin/blah
+sed '/^\s*#[^!].*/d' < $1 | base64 -w0

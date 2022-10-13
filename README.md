@@ -26,6 +26,7 @@ As most of these scripts are sanitised, there are some variables at the start th
 | mysql-meta | grab user grants or database metadata without having to remember the sql query to do so... |
 | mysql-tablemigrate | copy a monotonically-increasing large database table (200GB)
 | nginx_[dis|en]site |- make those nginx symlinks! |
+| remove-comments-and-base64-encode | useful for EC2 userdata scripts |
 | send-sms-global   | sends SMSes via SMS Global |
 | snappywrapper     | use the ec2 rolling snapshotter  within AWS, using instance role-based perms |
 | unifi-prune.js    | en-smallerise the mongo DB used by the unifi controller |
