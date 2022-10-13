@@ -22,6 +22,7 @@ As most of these scripts are sanitised, there are some variables at the start th
 | https-code-checker | checks http codes for http/https on given domains |
 | info.php | php info snippet for testing webserving works |
 | init.boilerplate.centos | init script template for ye olde CentOS, which I never want to touch again |
+| json2yaml         | convert json to human-readable yaml |
 | meat              | read config files without comments or empty lines (just the 'meat') |
 | mmsdump | use mongodump on an MMS-managed mongodb
 | mongo-backup      | script for making backup tar.gz's from a local mongo |
@@ -33,4 +34,5 @@ As most of these scripts are sanitised, there are some variables at the start th
 | snappywrapper     | use the ec2 rolling snapshotter  within AWS, using instance role-based perms |
 | unifi-prune.js    | en-smallerise the mongo DB used by the unifi controller |
 | vacri-in-a-box    | ops advice simulator for devs |
+| yaml2json         | convert yaml to human-illegible json|
 | yank              | script to overcome Docker's shortcomings for deployment |
