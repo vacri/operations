@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+""" apply redirect rules to a static s3 website and invalidate the associated
+    Cloudfront cache
+"""
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import time
+from pprint import pformat
+import yaml
+import requests
+import boto3
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+
+def getoptions():
+    """ ... gets... options?
+    """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              s3-static-site-update-redirects [OPTIONS] config_file
+              s3-static-site-update-redirects -w --debug deploy/s3/redirect-config.yml
+
+            This script updates s3 static site redirect rules, which can be
+            found in the s3 web console in the Management > Website section.
+            A cloudfront invalidation is also required as CloudFront caches
+            redirects. As invalidations are 'heavy' actions, the script will
+            quit out early if there's already an invalidation running. The
+            script is also designed to be an optional parameter-driven part
+            of a jenkins pipeline - it shouldn't be run unless the user has
+            specified an update. CloudFront invalidations can get 'stuck',
+            and if this is the case, we don't want to block further deploys
+            due to a long-running invalidation.
+
+
+            A config file is required, in the following format. Only one of
+            'rules' or 'rules-url' is allowed - we don't want to 'fall back'
+            and accidentally apply stale rules.
+
+                bucket: ops-slides.lkgtools.net
+                cloudfront-distro: E2Q8IESI0CFY0T
+                rules-url: https://foo.com/abc  # incompatible with 'rules'
+                rules:                        # incompatible with 'rules-url'
+                - Condition:
+                    KeyPrefixEquals: zzz
+                  Redirect:
+                    HostName: example.com
+                    Protocol: https
+                    ReplaceKeyWith: yyy
+                - Condition:
+                    KeyPrefixEquals: ggg
+                  Redirect:
+                    HostName: example.net
+                    Protocol: https
+                    ReplaceKeyWith: '111'
+
+            The cloudfront distro tells the script which location needs to have
+            an invalidation run. The bucket describes where the website rules
+            will be updated. The rules must be provided in full on their own,
+            or have a 'rules-url' provided instead, which the script will poll
+            for the right config.
+
+            Note that the 'Condition' can only be 'KeyPrefixEquals', but the
+            replacement can be either ReplaceKeyWith or ReplaceKeyPrefixWith -
+            the former is a full replace, the latter is a string substitution,
+            and will copy across the rest of the url slug
+
+            REQUIREMENTS:
+            - AWS perms to upload website config to the target s3 bucket
+            - AWS perms to invalidate cache on selected Cloudfront distro
+            - python 3, boto3
+            - config file
+
+            LIMITATIONS:
+            - rules file needs to have any pure numbers quoted to enforce
+              stringification (eg: a redirect to '123')
+            - rules url (pulling config from directus) NOT IMPLEMENTED YET,
+              because I don't know what it looks like or have a sample url :)
+
+        '''))
+
+
+    parser.add_argument('config_file', help='metadata file, yaml')
+    parser.add_argument('-w', '--wait-for-invalidation',
+                        help='wait for cloudfront invalidation to complete',
+                        action='store_true')
+    parser.add_argument('-q', '--quiet',
+                        help='sets loglevel=ERROR, good for cron',
+                        action='store_true')
+    parser.add_argument('--loglevel', help='', default='INFO')
+    parser.add_argument('--debug', help='overrides loglevel', action='store_true')
+
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+    finally:
+        if options.quiet:
+            options.loglevel = logging.ERROR
+        if options.debug:
+            options.loglevel = logging.DEBUG
+
+    return options
+
+
+
+def load_config(options):
+    """ load config from file
+        all these stupid 'try/excepts' are because python doesn't handle
+        non-existent vars gracefully
+    """
+
+    log.debug('loading config')
+
+    with open(options.config_file) as f:
+        cfg = yaml.load(f)
+
+    log.debug("cfg: %s", pformat(cfg))
+
+    # we want there to be one of either 'rules-url' or 'rules' in the config file
+    try:
+        options.rules_url = cfg['rules-url']
+    except KeyError:
+        log.debug('No rules URL set')
+        options.rules_url = ''
+    try:
+        options.rules = cfg['rules']
+    except KeyError:
+        log.debug('No rules file set')
+        options.rules = ''
+
+
+    if options.rules_url == '' and options.rules == '':
+        log.error('No rules URL or local rules file given, nowhere to fetch rules from, aborting')
+        sys.exit(22)
+    if options.rules_url != '' and options.rules != '':
+        log.error("Both a 'rules url' and 'rules' local config have been provided. Pick one. Aborting")
+        sys.exit(25)
+
+
+    try:
+        if cfg['bucket']:
+            options.bucket = cfg['bucket']
+            log.info("Will update bucket '%s'", options.bucket)
+    except KeyError:
+        log.error('No bucket found in config file. Aborting.')
+        sys.exit(34)
+
+
+
+    try:
+        options.cloudfront_distro = cfg['cloudfront-distro']
+        log.info("Will invalidate Cloudfront Distro '%s'", options.cloudfront_distro)
+    except AttributeError:
+        log.warning('No Cloudfront distro specified - no cache invalidation will be triggered')
+        options.cloudfront_distro = ''
+
+    return options
+
+
+
+
+def load_rules_url(options):
+    """ poll a directus url to retrieve the redirect rules
+    """
+
+    log.debug('loading rules url')
+
+    log.warning('Rules URL loading not implemented yet')
+    sys.exit(55)
+    ruleset = False
+    # until this is fleshed out, just return the file-based ruleset again,
+    # otherwise we replace it
+    return ruleset
+
+
+
+def build_website_config(index_document, error_document, ruleset):
+    """ creates a full dict for configuring the s3 website, as
+        boto3 does not support updating just the rules alone
+    """
+
+    log.debug('building website config')
+
+    cfg = {}
+    cfg['IndexDocument'] = index_document
+    cfg['ErrorDocument'] = error_document
+    cfg['RoutingRules'] = ruleset
+
+    log.debug('Website config: %s', pformat(cfg))
+
+    return cfg
+
+
+
+def update_s3_website_config(bucket_website, website_config):
+    """ push new website config to s3 website
+    """
+
+    log.debug('updating s3 website config')
+
+    log.info('Updating %s with these redirect rules: \n %s',
+             bucket_website.bucket_name,
+             pformat(website_config['RoutingRules'])
+            )
+
+    log.debug(pformat(website_config))
+    bucket_website.put(WebsiteConfiguration=website_config)
+
+
+
+def check_invalidation_status(client, cloudfront_distro):
+    """ check whether the given cloudfront ID has a currently
+        'in progress' invalidation or not. Invalidations can
+        get 'stuck', and it probably doesn't help to shove
+        more in the pipeline while this is happening
+    """
+
+    log.debug('checking invalidation status')
+
+    paginator = client.get_paginator('list_invalidations')
+
+    operation_parameters = {'DistributionId': cloudfront_distro}
+    page_iterator = paginator.paginate(**operation_parameters)
+
+    full_list = []
+    for page in page_iterator:
+        inprogress = [x['Id'] for x in page['InvalidationList']['Items'] if x['Status'] == 'InProgress']
+        full_list += inprogress
+
+    log.debug('Cloudfront invalidations currently running: %s', full_list)
+
+    return len(full_list)
+
+
+
+def invalidate_cache(options, client):
+    """ create a cloudfront invalidation for /*
+        an invalidation status check should be performed first
+    """
+
+    log.debug('invalidating cloudfront cache')
+
+    try:
+        response = client.create_invalidation(DistributionId=options.cloudfront_distro,
+                                              InvalidationBatch={
+                                                  'Paths': {
+                                                      'Quantity': 1,
+                                                      'Items': ['/*']
+                                                  },
+                                                  'CallerReference': str(int(time.time()))
+                                              })
+    except Exception as e:
+        log.error('Unexpected error trying to create CloudFront invalidation: %s', e)
+        sys.exit(25)
+
+    invalidation_id = response['Invalidation']['Id']
+
+    if options.wait_for_invalidation:
+        log.info('Waiting for CloudFront invalidation %s to complete...', invalidation_id)
+        waiter = client.get_waiter('invalidation_completed')
+        waiter.wait(DistributionId=options.cloudfront_distro,
+                    Id=invalidation_id
+                   )
+    else:
+        log.info('Cloudfront invalidation %s created, but not waiting for completion', invalidation_id)
+
+    return
+
+
+
+def update_bucket_rules(options, bucket_website):
+    """ compare current vs new rules, and kick off an update if there's a difference
+    """
+
+    log.debug('updating s3 bucket website redirect rules')
+
+    current_website_config = build_website_config(bucket_website.index_document, bucket_website.error_document, bucket_website.routing_rules)
+    new_website_config = build_website_config(bucket_website.index_document, bucket_website.error_document, options.ruleset)
+
+    log.debug('Current website config:\n%s', pformat(current_website_config))
+    log.debug('New website config:\n%s', pformat(new_website_config))
+
+    if new_website_config == current_website_config:
+        log.info('No ruleset changes detected, no updates or cache invalidation to be applied. Exiting.')
+        sys.exit(0)
+    else:
+        update_s3_website_config(bucket_website, new_website_config)
+
+
+
+def main():
+    """ ... main?
+    """
+
+    options = getoptions()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+    options = load_config(options)
+
+    options.ruleset = False
+    if options.rules:
+        options.ruleset = options.rules
+    elif options.rules_url:
+        options.ruleset = load_rules_url(options)
+    if not options.ruleset:
+        log.error('Failed to load a rules from a file or url. Aborting')
+        sys.exit(44)
+
+    if options.cloudfront_distro:
+        cfc = boto3.client('cloudfront')
+        if check_invalidation_status(cfc, options.cloudfront_distro) > 0:
+            log.error("Cloudfront distro '%s' has cache invalidations currently running. Will not apply s3 website ruleset updates. Aborting.", options.cloudfront_distro)
+            sys.exit(19)
+
+
+    s3r = boto3.resource('s3')
+    bucket_website = s3r.BucketWebsite(options.bucket)
+    if bucket_website.redirect_all_requests_to:
+        log.error('Bucket %s has a blanket redirect set (%s), is not a standard static website. Aborting', options.bucket, bucket_website.redirect_all_requests_to)
+        sys.exit(9)
+
+    update_bucket_rules(options, bucket_website)
+
+
+
+    if options.cloudfront_distro:
+        log.info('Invalidating Cloudfront cache')
+        invalidate_cache(options, cfc)
+
+
+
+    log.info('Validating update')
+    bucket_website.reload()
+    if bucket_website.routing_rules != options.ruleset:
+        log.critical('s3 website did not update correctly! Aborting.\nCurrent live ruleset:\n %s', pformat(bucket_website.routing_rules))
+        sys.exit(91)
+
+    log.info('Done.')
+
+
+if __name__ == '__main__':
+    main()

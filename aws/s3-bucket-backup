@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+""" 1) find s3 backup bucket by tag
+    2) find list of s3 buckets to back up by tag
+    3) put the contents of the latter in the former
+    4) maybe notify Slack if you can figure out how to auth
+
+    IAM for slack credentials from EC2 Parameter Store:
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ssm:GetParametersByPath",
+                "ssm:GetParameters",
+                "ssm:GetParameter"
+            ],
+            "Resource": "arn:aws:ssm:*:*:parameter/admin/backups/*"
+        }
+
+
+    IAM for s3 backups user (this bucket will need to have the correct tag
+    applied for the script to find it)
+
+        {
+            "Sid": "Write to s3 backup location",
+            "Effect": "Allow",
+            "Action": "s3:*",
+            "Resource": "arn:aws:s3:::MYBACKUPBUCKET/s3/*"
+        },
+        {
+            "Sid": "Global s3 read",
+            "Effect": "Allow",
+            "Action": [
+                "s3:Get*",
+                "s3:List*"
+            ],
+            "Resource": "*"
+        }
+"""
+
+#from __future__ import print_function
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import socket
+from subprocess import Popen, PIPE
+import requests
+import boto3
+from botocore.exceptions import ClientError
+#from slackclient import SlackClient
+from slack import WebClient
+
+
+# TODO: rework this klunky boilerplate
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+            Usage:
+                s3-bucket-backup [-d] [-v] [(key overrides)] go
+
+            In cron:
+                /PATH/TO/s3-bucket-backup go 2>&1 | logger -t s3-bucket-backup
+
+            s3-bucket-backup will look through the s3 list for buckets marked with the tag
+            "s3-bucket-backup:True", and then back up those buckets to this location:
+
+                s3://BACKUP_BUCKET/s3/SOURCE_BUCKET/
+
+            It is expected that the "BACKUP_BUCKET" bucket has versioning turned on. The
+            copy consists of an 'aws s3 sync --delete', so files will be removed from the
+            backup if removed from the source, however s3 versioning will keep removed
+            files around according to lifecycle rules
+
+            This backup script is written with the expectation that AWS perms will come from
+            server roles, though of course any awscli-compatible perms will work. The script
+            should not be run from a location where it can write to the source buckets
+            (ie: readonly access to source, as normal for a backup user), and is designed to
+            be run from cron, logging to syslog via logger
+
+            LIMITATIONS:
+            - This script does not cater to Glacier-enabled buckets, but it's not meant to
+              be backing up 'cold storage' data. It's not tested, but it's going to break if
+              it tries to sync a glacier item
+            - This script assumes env-supplied credentials (IAM server roles/env vars/user env),
+              and is not intended to handle explicit IAM keys/secrets
+            - Assumes a single backup bucket, and hardcodes the key prefix to "s3/".
+            - dryrun turns on verbosity in the subtool, so be prepared for spam on big buckets
+            - needs IAM permissions to read Slack credentials out of Parameter Store, if you
+              want to notify Slack
+
+        '''))
+
+    parser.add_argument('go', help="all my potentially destructive scripts require an arg or they won't run, even if they don't 'need' an arg :)", default='help')
+    parser.add_argument('-d', '--dry-run', help='run sync in dry-run mode', action='store_true')
+    parser.add_argument('-v', '--verbose', help='show aws cli sync spam', action='store_true')
+    parser.add_argument('-p', '--backup-key-prefix',
+                        help="s3 object prefix (='backup folder inside bucket')",
+                        default='s3/')
+
+
+    parser.add_argument('-b', '--backup-bucket-tag-key',
+                        help='name of tag to identify backup destination bucket',
+                        default='backup-store')
+    parser.add_argument('-B', '--backup-bucket-tag-value',
+                        help='value of tag to identify backup destination bucket (case insensitive)',
+                        default='True')
+
+
+    parser.add_argument('-k', '--source-bucket-tag-key',
+                        help='name of tag to identify source buckets to copy',
+                        default='backup')
+    parser.add_argument('-K', '--source-bucket-tag-value',
+                        help='value of tag to identify source buckets to copy (case insensitive)',
+                        default='True')
+
+    options = parser.parse_args()
+
+    if options.go != 'go':
+        parser.print_help()
+        sys.exit()
+
+    if options.backup_bucket_tag_key == options.source_bucket_tag_key:
+        log.error("Source and target tags are the same - can't back up a bucket to itself. Aborting")
+        sys.exit(12)
+
+    options.ip = get_ip()
+
+    try:
+        options.slack_token = ssm_fetch_value('/admin/backups/slack-notify-token')
+        options.slack_channel = ssm_fetch_value('/admin/backups/slack-notify-channel')
+        options.slack = True
+    except:
+        log.warning("Failed to retrieve all Slack details from Parameter Store, slack notification disabled")
+        options.slack = False
+
+    return options
+
+
+# nicked from https://stackoverflow.com/a/28950776/4719191
+def get_ip():
+    """ get default localhost ip
+    """
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+
+def get_aws_region():
+    """ it is beyond ridiculous how difficult it is to identify the region as you
+        are running in it seems like the most obvious thing for Boto to support,
+        given 'region' is a frequent mandatory arg
+    """
+
+    r = requests.get("http://169.254.169.254/latest/dynamic/instance-identity/document")
+    response_json = r.json()
+    region = response_json.get('region')
+
+    return region
+
+
+
+def ssm_fetch_value(key):
+    """ given a key, return the value from Parameter Store
+    """
+
+    region = get_aws_region()
+
+    ssm = boto3.client('ssm', region_name=region)
+
+    value = ssm.get_parameter(Name=key)['Parameter']['Value']
+
+    return value
+
+
+def notify_slack(options, message, level='info'):
+    """ notify a slack channel with a message
+    """
+
+    if options.slack:
+        sc = WebClient(options.slack_token)
+
+        result = sc.api_call(
+            api_method="chat.postMessage",
+            params={
+                'channel': options.slack_channel,
+                'text': message
+                }
+        )
+
+        if not result['ok']:
+            log.error("Failed to send slack message: %s", result['error'])
+
+
+def list_buckets_by_tag(key, value):
+    """ list s3 buckets by provide tag name/value
+        this can be slow if there are a lot of buckets, but I couldn't find
+        a simple way to query the API without iterating through all buckets
+    """
+
+    s3r = boto3.resource('s3')
+    s3c = boto3.client('s3')
+
+    log.debug('Checking tags for all buckets...')
+    bucket_list = []
+    for bucket in s3r.buckets.all():
+        try:
+            bucket_tagging = s3c.get_bucket_tagging(Bucket=bucket.name)
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchTagSet':
+                log.debug('Bucket %s has no tags...', bucket.name)
+                continue
+            else:
+                log.error('Unexpected error: %s', e)
+        tag_set = bucket_tagging['TagSet']
+
+        for tag in tag_set:
+            if tag['Key'] == key and tag['Value'].lower() == value.lower():
+                bucket_list.append(bucket.name)
+
+    return bucket_list
+
+
+
+def find_backup_bucket_by_tag(options):
+    """ find the backup bucket. There should be 1. Not 0. Not > 1. 1.
+        Warn if versioning is not enabled. Abort if not writable
+    """
+
+    bucket_list = list_buckets_by_tag(options.backup_bucket_tag_key, options.backup_bucket_tag_value)
+
+
+    if len(bucket_list) == 0:
+        log.error("Backups bucket not found (no bucket found with tag '%s: %s'). Aborting", options.backup_bucket_tag_key, options.backup_bucket_tag_value)
+        sys.exit(6)
+
+    if len(bucket_list) > 1:
+        log.error("More than one bucket found with backup tag ('%s: %s'). Unclear which to use. Aborting", options.backup_bucket_tag_key, options.backup_bucket_tag_value)
+        log.error("(backup-tagged buckets found: %s)", bucket_list)
+        sys.exit(7)
+
+    backup_bucket = bucket_list[0]
+
+    # TODO: perhaps also check that there are lifecycle rules on the bucket
+    #       (just a simple check for presence, don't try to parse)
+    if check_versioning_on_bucket(backup_bucket):
+        log.debug('Versioning enabled on backups bucket')
+    else:
+        log.warning('Versioning is not enabled on the backups bucket. This is bad - turn it on!')
+
+    if check_bucket_readwrite_perms(backup_bucket) not in ['write', 'write-only']:
+        log.error("No permissions to write to backup bucket '%s'. Aborting.", backup_bucket)
+        notify_slack(options, "Backup script on %s does not have write access to nominated backup bucket '%s', backups not run" % (options.ip, backup_bucket), level='error')
+        sys.exit(9)
+
+    return backup_bucket
+
+
+
+def check_versioning_on_bucket(bucket):
+    """ Check if Versioning is enabled on the bucket
+        1) key 'Status' is present if it is
+        2) and has a value of 'Enabled' (Versioning can't be removed, but can be disabled)
+    """
+
+    s3c = boto3.client('s3')
+    versioning = s3c.get_bucket_versioning(Bucket=bucket)
+
+    versioning_enabled = False
+    try:
+        if versioning['Status'] == 'Enabled':
+            versioning_enabled = True
+    except:
+        pass
+
+    return versioning_enabled
+
+
+
+def find_source_buckets_by_tag(key, value):
+    """ finds... source... buckets... by... tag?
+    """
+
+    bucket_list = list_buckets_by_tag(key, value)
+
+    return bucket_list
+
+
+
+def check_bucket_read(bucket_name):
+    """ this is quick'n'dirty. The internet seems to think that
+        all you need is a 'head bucket' operation, but getting a
+        bucket 'head' has different IAM perms than getting bucket
+        objects...
+    """
+
+    s3r = boto3.resource('s3')
+    #bucket = s3.Bucket(bucket_name)
+    try:
+        s3r.meta.client.head_bucket(Bucket=bucket_name)
+        return True
+    except ClientError as e:
+        error_code = int(e.response['Error']['Code'])
+        if error_code == 403:
+            log.debug("Bucket location forbidden - unable to access, regardless of whether it exists")
+            return False
+        elif error_code == 404:
+            log.debug("Bucket '%s' does not exist", bucket_name)
+            return False
+        else:
+            log.error('Unexpected error: %s', e)
+
+
+
+def check_bucket_write(bucket_name):
+    """ this is quick'n'dirty, but it seems to be what AWS does to check write
+        access (eg: testing log delivery)
+    """
+
+    s3c = boto3.client('s3')
+
+    # prefix here must match IAM write perms on intended backup bucket
+    testfile = 's3/s3-bucket-write-access-testfile'
+
+    put_object = False
+    try:
+        s3c.put_object(
+            Bucket=bucket_name,
+            Body='This is a test file for checking write access for the s3 bucket backup script. It should have been deleted. Something has probably gone wrong',
+            Key=testfile
+        )
+        put_object = True
+    except:
+        log.debug('Failure trying to write a testfile to %s; this (probably) means no write access', bucket_name)
+        return False
+
+    # cleanup
+    if put_object:
+        try:
+            s3c.delete_object(
+                Bucket=bucket_name,
+                Key=testfile
+            )
+        except Exception as e:
+            log.warning('Could write testfile to %s to check write access, but had error on removal: %s', bucket_name, e)
+
+    return True
+
+
+
+def check_bucket_readwrite_perms(bucket_name):
+    """ This is quick'n'dirty, not canonical
+    """
+
+    read = check_bucket_read(bucket_name)
+    write = check_bucket_write(bucket_name)
+
+    if read:
+        if write:
+            return 'write'
+        else:
+            return 'read'
+    else:
+        if write:
+            return 'write-only'
+        else:
+            return 'none'
+
+
+
+def stream_command(command):
+    """ will print output of subshell to STDOUT in realtime
+        nicked from https://zaiste.net/realtime_output_from_shell_command_in_python/
+
+        needs to be called in a loop like:
+        for line in stream_command("ping google.com"):
+            log.info(line)
+    """
+
+    log.debug("about to stream output for command '%s'", command)
+    process = Popen(command, stdout=PIPE, shell=True)
+    while True:
+        line = process.stdout.readline().rstrip()
+        if not line:
+            break
+        yield line
+
+    process.poll()
+
+    rc = process.returncode
+    if rc != 0:
+        log.error("Command failed with return code %d", rc)
+        log.error("command: %s", command)
+        raise ValueError
+
+
+
+def sync_to_backup_loc(source_loc, backup_loc, dryrun=False, verbose=False):
+    """ copy source to backup using aws s3 sync as a subprocess
+    """
+
+    # cron needs full paths
+    cmdprefix = '/usr/local/bin/aws s3 sync --delete'
+
+    if dryrun == True:
+        cmdprefix += ' --dryrun'
+
+    if verbose == False:
+        cmdprefix += ' --only-show-errors'
+
+    if check_bucket_write(source_loc):
+        log.warning('Backup script has write access to source location %s - not ideal', source_loc)
+
+    cmd = ' '.join([cmdprefix, source_loc, backup_loc])
+
+    issues = False
+    try:
+        for line in stream_command(cmd):
+            log.info(' %s', line)
+    except:
+        log.error("Unexpected error when syncing %s (logs should be above ^^)", source_loc)
+        issues = "Issue syncing %s to %s" % (source_loc, backup_loc)
+
+    return issues
+
+
+
+def main():
+    """ ... main?
+    """
+
+    log.info('Start backing up s3 buckets...')
+    options = getoptions()
+
+
+
+    log.info('Finding the backup storage bucket by tag...')
+    backup_bucket = find_backup_bucket_by_tag(options)
+    log.info("... %s", backup_bucket)
+
+
+
+    log.info('Finding the source buckets to back up...')
+    bucket_list = find_source_buckets_by_tag(options.source_bucket_tag_key, options.source_bucket_tag_value)
+    log.info('... %s', bucket_list)
+
+
+
+
+
+    if options.dry_run:
+        log.info('Dry run enabled')
+    if options.verbose:
+        log.info('Verbose/aws-s3-sync-spam enabled')
+
+    problems = []
+    for source_bucket in bucket_list:
+
+        source_loc = 's3://' + source_bucket + '/'
+        backup_loc = 's3://' + backup_bucket + '/' + options.backup_key_prefix + source_bucket + '/'
+
+        log.info("Backing up %s to %s...", source_loc, backup_loc)
+        issues = sync_to_backup_loc(source_loc, backup_loc, dryrun=options.dry_run, verbose=options.verbose)
+
+        if issues:
+            problems.append(issues)
+
+
+    if problems:
+        log.error("Summary of problem syncs during this backup run:")
+        for issue in problems:
+            log.error("- %s", issue)
+
+        # There isn't an easy way to get the AWS cli tool error into this message...
+        notify_slack(options,
+                     "S3 backup script on %s encountered problems, see script logs (in syslog) for details. Problem summary: %s" % (options.ip, '; '.join(problems)),
+                     level='error')
+        notify_slack(options, "S3 backup script on %s attempted for following tagged buckets: %s" % (options.ip, ', '.join(bucket_list)))
+
+        sys.exit(13)
+
+
+    notify_slack(options, "S3 backup script on %s complete for following tagged buckets: %s" % (options.ip, ', '.join(bucket_list)))
+    log.info('S3 bucket backup done')
+
+if __name__ == '__main__':
+    main()

@@ -22,3 +22,5 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | rds-db-backup-tester    | tests mysql backup files by installing to a temp db |
 | rds-db-init             | creates empty dbs on RDS mysql, using lookups from Parameter Store |
 | route53_backup.py       | AWS Lambda code to backup route53 zones to s3 |
+| s3-bucket-backup        | backups up s3 buckets to a subdir of another bucket. Good for web asset buckets, even with s3 file versioning |
+| s3-static-sote-update-redirects | s3 static websites have a page redirection engine. this script is used to update the rules list |
