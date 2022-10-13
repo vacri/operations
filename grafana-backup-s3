@@ -1,0 +1,59 @@
+#!/bin/bash
+# Boilerplate for bash scripts
+# NOTE: positional args are converted from $1 to $ARG1 for use with 'set -u'
+
+# fail immediately on error
+set -e
+set -o pipefail
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+grafanadb=/var/lib/prometheus # no slash on end
+s3_loc=s3://MY_S3_BUCKET/grafana/
+grafana_dumpfile=/tmp/grafanadb_$(date +%d).sql3
+
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME go
+
+$PROGNAME is an sqlite3 backup script, focused on backing up Grafana
+
+It does a simple rotation by including the day-of-month in the
+filename, and will naturally overwrite itself. This rotation method was chosen before I became comfortable with s3 file versioning.
+
+Requirements:
+- sqlite3 client
+- s3 perms
+  - assumes role-based perms, so no keys stored here
+
+$PROGNAME is intended to be run as a cronjob
+
+EOF
+exit 0
+}
+
+if [ -z "$1" ]; then usage; fi
+
+log(){
+    echo "$(date -Is): $@"
+}
+
+log "Backing up Grafana data"
+log "Dumping db..."
+
+sqlite3 /var/lib/grafana/grafana.db <<EOF
+.timeout 20000
+.backup $grafana_dumpfile
+EOF
+
+log "Compressing dumpfile..."
+
+nice gzip -f "$grafana_dumpfile"
+
+# server needs an IAM role to allow this
+log "Copying backup file to $s3_loc..."
+/usr/local/bin/aws s3 cp "$grafana_dumpfile.gz" "$s3_loc"
+
+log "Done."
+

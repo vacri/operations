@@ -1,0 +1,67 @@
+#!/bin/bash
+# curl gives an http code of 000 for a number of cnx errors, including 'couldn't connect' and 'cert is bad'
+
+# this script was used to figure out which domains out of a list of hundreds were still serving 'something', and which also supported https
+
+if [ -z "$1" ]; then
+    echo "Usage: while read domain; do ./https-code-checker \$domain; done < domains.txt"
+    echo "    OR ./https-code-checker www.example.com www.example.net"
+    echo
+    echo "Note: basename -> www. and www. -> basename 300s on https = green/OK"
+    exit 0
+fi
+
+set -u
+
+function colourise_http() {
+    case ${1:0:1} in
+        2|3) echo 92;; # bright green
+        0|5) echo 91;; # bright red
+        *) echo 93;;   # bright yellow
+    esac
+}
+
+function colourise_https_300s() {
+    # okay, this is hackier than I wanted. No more hackiness!
+
+    if [ "${hostname:0:4}" == 'www.' ]; then
+        # does hostname redirect to same name without www. prefix?
+        www_redirect=$(curl -s -I https://$hostname | grep -i location | grep -Po "${hostname:4}")
+    else
+        # does hostname redirect to same name with added www. prefix
+        www_redirect=$(curl -s -I https://$hostname | grep -i location | grep -Po "www.(?=$hostname)")
+    fi
+
+    www_status=$(echo -n "$www_redirect" | wc -c)
+
+    if [ "$www_status" == "4" ]; then
+        echo 92 # bright green
+    else
+        echo 93 # bright yellow
+    fi
+}
+
+
+function colourise_https() {
+    case ${1:0:1} in
+        2) echo 92;;   # bright green
+        3) colourise_https_300s;;
+        0|5) echo 91;; # bright red
+        *) echo 93;;   # bright yellow
+    esac
+}
+
+for host in $@; do
+
+    hostname=$host
+
+    # redirects are expected on http, so make 'em green
+
+    http_code=$(curl --connect-timeout 3 -s -o /dev/null -w "%{http_code}" http://$hostname)
+    https_code=$(curl --connect-timeout 3 -s -o /dev/null -w "%{http_code}" https://$hostname)
+
+    echo -e "\e[$(colourise_http $http_code)m$http_code - http  - $hostname\e[0m"
+    echo -e "\e[$(colourise_https $https_code)m$https_code - https - $hostname\e[0m"
+
+done
+

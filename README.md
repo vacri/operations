@@ -18,6 +18,8 @@ As most of these scripts are sanitised, there are some variables at the start th
 | kvm-backup        | backup KVM virtual machines that aren't snapshottable (requires VM downtime) |
 | gatekeeper        | tar/zipfile deployer for autoscaled VMs, see README in subdir |
 | git-counter       | compare contributors' lines of code for a repo |
+| grafana-backup-s3 | backs up grafana db (settings) to s3 |
+| https-code-checker | checks http codes for http/https on given domains |
 | info.php | php info snippet for testing webserving works |
 | init.boilerplate.centos | init script template for ye olde CentOS, which I never want to touch again |
 | meat              | read config files without comments or empty lines (just the 'meat') |
