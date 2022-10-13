@@ -1,0 +1,168 @@
+#!/bin/bash
+# Use this script as userdata to detect logging environment and applications to
+# deploy The script is designed for autoscaling group servers to auto-provision
+# themselves using the 'gatekeeper' deployment script
+# The following ec2 tags are required:
+# - 'env'
+# - 'component' (basically 'application name')
+# - 'ENV-COMPONENT-deploy' for each application you want installed
+
+clean="yes"
+# can't figure out a way to get ec2 instances to detect the account they're in, so hardcode it...
+aws_account=MY_AWS_ACCOUNT_NICKNAME
+# new (dec 2018) 'gatekeeper' needs to be told which bucket to find packages in
+s3_packages_bucket=${aws_account}-packages
+s3_configs_bucket=${aws_account}-configs
+
+log () {
+     echo "$(date +%T) $@"
+}
+
+# stop nginx - start it again at the end if everything is clean
+log "Stopping nginx..."
+systemctl stop nginx
+
+##
+## network-checking nonsense
+##
+# wait until the network is up and responsive (needed for grabbing EC2 tags)
+# I have seen it take up to 20 or so seconds before it's available (but usually it's pretty quick)
+# "ec2 metadata" is different to the "ec2 api" - need to check both (and both are different to the network itself)
+# TODO: ec2metadata may automatically wait for the network, which would remove the need for the loops and backoff here.
+#       Confirm if this is the case with AWS support
+
+log "Waiting for network env / EC2 api to provision..."
+i=0
+while true; do
+    ((i++))
+    log "... fetching AWS region"
+    region=$(ec2metadata --availability-zone | sed s/.$//)
+    # regions should have two hyphens in them...
+    if grep -q ".*-.*-.*" <<< "$region"; then break; fi
+    if [ "$i" == 10 ]; then log "... ec2 metadata not available, exiting"; exit 6; fi
+    sleep $i
+done
+log "   -> $region"
+
+
+#if above is working, ec2metadata should be available
+log "... fetching instance-id"
+instance_id=$(ec2metadata --instance-id)
+log "   -> $instance_id"
+
+
+##
+## set logging details
+##
+
+# We need to keep trying the logging component until something matches up
+# this tells us the following three things:
+# 1) the EC2 network API for the instance is up
+# 2) the EC2 network API for the instance is populated with the instances tags
+# 3) the instance itself has tags
+#    (we don't know ahead of time if it has deploy tags, or what they might be)
+log "Detecting EC2 env tags on self for logging..."
+i=0
+while true; do
+    ((i++))
+    log "... fetching logging env"
+    logging_env=$(aws ec2 describe-tags \
+                                --region "$region" \
+                                --filter \
+                                "Name=resource-id,Values='$instance_id'" \
+                                "Name=key,Values='env'" \
+                                --output text \
+                               | awk '{print $5}' \
+                               || echo 'unset'
+                             )
+
+    case $logging_env in
+        prod*|stag*|test*|dev*|unset|admin) log "   -> $logging_env"; break;;
+        *) :;;
+    esac
+
+    if [ "$i" == 10 ]; then log "... unable to fetch instance 'env' tag, exiting"; exit 7; fi
+    sleep $i
+done
+
+# exit on any error from here (= bad server, nginx won't start at the end, healthcheck will fail)
+set -e
+#set -o pipefail #we don't want it to fail (silently) in a pipe - we are 'catching' those problems
+
+# the above logging_env loop 'proves' the API is accessible and populated, so
+# we don't need a backoff loop from here
+log "... fetching logging component"
+logging_component=$(aws ec2 describe-tags \
+                            --region "$region" \
+                            --filter \
+                            "Name=resource-id,Values='$instance_id'" \
+                            "Name=key,Values='component'" \
+                            --output text \
+                           | awk '{print $5}' \
+                           || echo 'unset'
+                         )
+
+if [ "$logging_component" == "" ]; then
+    log "   ... logging component detected blank (faulty), exiting"
+    exit 9
+else
+    log "   -> $logging_component"
+fi
+
+log "Setting logging metadata..."
+/bin/sed -i "s/^fields.env.*/fields.env: $logging_env/" /etc/filebeat/filebeat.yml
+/bin/sed -i "s/^fields.component.*/fields.component: $logging_component/" /etc/filebeat/filebeat.yml
+systemctl restart filebeat
+
+##
+## deploy application(s)
+##
+# tag needs to be in "ENV-COMPONENT-deploy" format
+log "Detecting EC2 deploy tags on self..."
+apps=$(aws ec2 describe-tags --region "$region" --filter "Name=resource-id,Values=$instance_id" --output=text \
+       | grep -i 'True$' \
+       | awk '{print $2}' \
+       | grep -e '-deploy$' \
+       | sed s/-deploy$//
+     )
+log "deploy tags found:
+${apps[*]}"
+
+# '${#apps[@]} -eq 0' didn't work for some reason when the old code was
+# not successfully reading tags - I think it had a zero-length element
+if [ ${#apps[@]} -eq 0 ] || [ "${apps[0]}" == "" ]; then
+    log "No apps found via deploy tags. Exiting early (nginx is stopped)"
+    exit 8
+fi
+
+# needs to be in "ENV-COMPONENT" format ('deploy' gets chopped off above)
+# don't quote apps[@] here.
+for app in ${apps[@]}; do
+    app_env=$(cut -f1 -d- <<<$app)
+    app_component=$(sed "s/^$app_env-//" <<<$app)
+    log "Installing $app_env/$app_component with gatekeeper..."
+    # do not restart services (-R) with gatekeeper here - nginx is started at the end
+    /usr/local/bin/gatekeeper -b $s3_packages_bucket -e $app_env install $app_component
+    if [ $? -ne 0 ]; then
+        clean="no"
+    fi
+
+    # if it's a gatekeeper-installed php app, this location will exist
+    if [ -d "/var/www/$app_component/config" ]; then
+        log "Pulling config files (if any) for $app_env/$app_component from s3..."
+        # this sync will not error if the source is empty/absent
+        /usr/local/bin/aws s3 sync \
+            s3://$s3_configs_bucket/$app_component/$app_env/ \
+            /var/www/$app_component/config/
+        if [ $? -ne 0 ]; then
+            clean="no"
+        fi
+    fi
+done
+
+if [ "$clean" == "yes" ]; then
+    log "Starting nginx..."
+    systemctl start nginx
+fi
+
+log "Done."

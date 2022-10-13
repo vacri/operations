@@ -20,6 +20,8 @@ It uses s3 to store an index file of packages and also the packages themselves. 
 
 The CI system then deploys by finding the appropriately-tagged VMs, sshing in, and running the deploy script twice. The first run reads the index file and preps the system by pulling the package file and installing it, and the second run activates the new package by switching a symlink. It's broken into two parts this way so that the actual active deployment is a single atomic action for each server.
 
+The deploy script looks at the tags on the EC2 instance it is running on, then evaluates the index files and figures out which packages to pull. There is also an ec2 userdata script that can be used to self-provision a server on first boot
+
 Why did it stop being used?
 ---------------------------
 
