@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# fail immediately on error
+set -e
+set -o errtrace
+set -o pipefail
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    (in cron) /PATH/TO/$PROGNAME VPN_NAME
+
+Generate a new CRL for the nominated openvpn service and copy the file into
+place. The CRL file is checked on each new connection request, and the service
+does not need to be reloaded to pick up changes.
+
+OpenVPN CRL files expire, and refuse to accept new connections until the CRL
+is updated.
+
+This script is meant to be run under cron as root, and works with ovpn 2.4
+EOF
+exit 0
+}
+
+if [ -z "$1" ]; then usage; fi
+
+source_file="/etc/easyrsa/pki/crl.pem"
+target_file="/etc/openvpn/server/$1/crl.pem"
+
+if [ ! -f $target_file ]; then
+    echo "Update target $target_file not found - is '$1' correct? Aborting"
+    exit 3
+fi
+
+cd /etc/easyrsa
+# easyrsa talks on both stderr and stdout in normal operation, not good for cron
+./easyrsa gen-crl 1>/dev/null 2>&1 \
+    || (echo "There was a problem generating the OpenVPN CRL file - manual intervention required"; exit 4)
+install --backup --suffix .backup --mode 0644 "$source_file" "$target_file"

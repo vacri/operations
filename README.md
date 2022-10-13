@@ -36,6 +36,9 @@ As most of these scripts are sanitised, there are some variables at the start th
 | send-sms-global   | sends SMSes via SMS Global |
 | snappywrapper     | use the ec2 rolling snapshotter  within AWS, using instance role-based perms |
 | unifi-prune.js    | en-smallerise the mongo DB used by the unifi controller |
+| update-openvpn-crl | update openvpn cert revocation list (list older than 90 days = no new cnx) |
 | vacri-in-a-box    | ops advice simulator for devs |
+| wpengine-copy     | CI script to copy content to an ssh-capable WPEngine install |
+| xwiki-backup-s3   | backs up xwiki to s3 (defunct) |
 | yaml2json         | convert yaml to human-illegible json|
 | yank              | script to overcome Docker's shortcomings for deployment |

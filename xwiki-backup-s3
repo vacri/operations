@@ -1,0 +1,119 @@
+#!/bin/bash
+
+# fail immediately on error
+set -e
+set -o pipefail
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+promdata_dir=/var/lib/prometheus # no slash on end
+backup_filename=xwiki-backup.tar.gz
+s3_backup_location="s3://MYBUCKET/xwiki/$backup_filename"
+pghost=RDSPREFIX.ap-southeast-2.rds.amazonaws.com
+pgport=5432
+pguser=xwiki
+pgdb=xwikidb
+pgpass=MYPASS
+xwiki_cfg_files=(hibernate.cfg.xml
+                 xwiki.cfg
+                 xwiki.properties
+                 classes/logback.xml
+                )
+
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME go
+
+$PROGNAME is used to back up the Xwiki installation, as per the guidelines
+at https://www.xwiki.org/xwiki/bin/view/Documentation/AdminGuide/Backup
+
+It takes a psql dump, config file copy, and 'permanent dir' copy, tars them up,
+and deposits them on s3.
+
+This script is designed to be run as a cronjob, and should be run as the Tomcat user, in order to access the xwiki 'permanent' data directory.
+
+Requirements:
+- aws cli tool
+- pg_dump 10.4+
+- s3 perms
+  - this script assumes role-based perms, so no keys stored here
+
+$PROGNAME is intended to be run as a cronjob.
+
+The S3 bucket should have a lifecycle rule on this location to expire old
+backups after X days, and older versions of the backup will simply be earlier
+versions of the uploaded backup file.
+
+Restoring the backups should simply be running pg_restore, and copying back the tarred files. 'Should'.
+
+EOF
+exit 0
+}
+
+if [ -z "$1" ]; then usage; fi
+
+cleanup(){
+    log "Removing temporary directory..."
+    rm -r $TMPDIR
+    log "Done."
+}
+
+log(){
+    echo "$(date -Is)> $@"
+}
+
+trap cleanup exit # on any exit
+
+log "Backing up LKG xwiki data..."
+
+TMPDIR="$(mktemp -d)"
+
+mkdir -p "$TMPDIR"/{psql,config/classes,config,data}
+
+cd "$TMPDIR"
+
+log "Dumping postgres database..."
+PGPASSWORD="$pgpass" pg_dump \
+    --host "$pghost" \
+    --port "$pgport" \
+    --username "$pguser" \
+    --dbname "$pgdb" \
+    --format c \
+    --file psql/xwikidb.pgdump
+
+log "Fetching config files..."
+# cluster info in /observation/ is not relevant for us
+for file in ${xwiki_cfg_files[@]}; do
+    cp "/etc/xwiki/$file" "config/$file"
+done
+
+log "Fetching 'permanent' data..."
+rsync -a /var/lib/xwiki/data/ data/
+
+cat > README.txt <<EOF
+Backup taken: $(date)
+
+This is a backup of the LKG Xwiki installation, and comes in three parts as per
+https://www.xwiki.org/xwiki/bin/view/Documentation/AdminGuide/Backup
+
+1. psql dump - if restoring to a new pghost, the jdbc link in hibernate.xml
+   will need to be updated
+2. config files - these get copied into /etc/xwiki/
+3. xwiki 'permanent' data dir - this gets copied to /var/lib/xwiki/data
+
+The xwiki install is installed via Debian packages, from the official XWiki apt
+repo. Other forms of installation will have different target locations to the
+ababove.
+EOF
+
+log "Tarring up backup files..."
+tar zcf "$backup_filename" *
+
+log "Uploading to (versioned) s3 location ($s3_backup_location)..."
+/usr/local/bin/aws s3 cp "$backup_filename" "$s3_backup_location"
+
+# cleanup happens on exit
+
+
+

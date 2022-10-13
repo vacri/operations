@@ -1,0 +1,92 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import sys
+import os
+import argparse
+import time
+import textwrap
+import logging
+import pysftp
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+# real iso8601, not the 'iso8601 with several changes to it' of the logging module
+if time.tzname[0] == 'UTC':
+    formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                '%Y-%m-%dT%H:%M:%SZ')
+else:
+    if sys.version_info[0] == 2:
+        # python 2's TZ here is stuffed (always reports +00:00) so drop it
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                '%Y-%m-%dT%H:%M:%S')
+    else:
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                '%Y-%m-%dT%H:%M:%S%z')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              wpengine-copy [-u USER] [-p PASSWORD] [-d DEST_DIR] SOURCE_DIR HOST PORT
+
+            wpengine-copy is really just an sftp recursive copy script, but we're using
+            it for WPEngine as the other options for pushing content don't work for our
+            workflow. The cli tool 'sftp' is designed to be interactive, and the 'scp'
+            tool doesn't handle copying from relative paths over sftp well, so here we
+            are.
+
+            The DEST_DIR arg is only necessary if you want to copy to a subdir
+        '''))
+
+    parser.add_argument('source_dir', help='source dir holding files to copy', default='help')
+    parser.add_argument('host', help='target sftp host', default='help')
+    parser.add_argument('port', help='target sftp port', type=int, default='help')
+    parser.add_argument('-d', '--dest-dir', help='', default='/')
+    parser.add_argument('-u', '--user', help='', default='')
+    parser.add_argument('-p', '--password', help='', default='')
+
+
+    options = parser.parse_args()
+
+    return options
+
+def main():
+
+    options = getoptions()
+
+    log.info("Recursively copying %s to sftp://%s:%s%s...",
+             options.source_dir,
+             options.host,
+             options.port,
+             options.dest_dir
+            )
+
+    cnopts = pysftp.CnOpts()
+    cnopts.hostkeys = None   # this disables hostkey checking, which is Bad, but I can't see us adding the individual site keys to the buildserver any time soon
+
+    with pysftp.Connection(host=options.host,
+                           port=options.port,
+                           username=options.user,
+                           password=options.password,
+                           cnopts=cnopts
+                          ) as sftp:
+
+        sftp.put_r(options.source_dir, options.dest_dir)
+
+    log.info("Done.")
+
+
+
+if __name__ == '__main__':
+    main()
