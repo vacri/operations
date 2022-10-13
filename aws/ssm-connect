@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+# TODO: proper region support
+# TODO: fix passing signals to the underlying shell (eg: ctrl+C kills this python session, not the command in the remote shell)
+
+""" A friendly wrapper for connecting to AWS Session Manager capable EC2 instances
+    Allows you to choose a target from a matching list, or you can supply the InstanceID
+"""
+
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+## add this line if we start using common in-house libs
+#sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
+import subprocess
+import boto3
+import enquiries
+
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+
+def get_options():
+    """ ... gets... options?
+    """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              ssm-connect [--profile FOO] [--region BAR] [-i InstanceId] [SUBSTRING_FILTER]
+              ssm-connect -o   (output mode)
+
+            WARNING: signals (ctrl+C and similar) apply to the local script,
+               not the remote shell. Ctrl+C will cancel the local script
+
+            ssm-connect is a wrapper around the AWS CLI tool to make finding
+            your instance a bit friendlier. It'll choof off with your details
+            and provide a friendly list of instance names that you can connect
+            to.
+
+            The 'friendly names' are pulled from the instance "Name" tags, and
+            any valid instances without this tag will be shown with their
+            InstanceId instead.
+
+            ssm-connect can work with either AWS env vars or by supplying a
+            suitable --profile arg. If you want a non-default region, it must
+            be supplied by --region arg.
+
+            You can optionally specify an --instance using the EC2 Instance ID,
+            but that's not too different from using the underlying ssm connection
+            command.
+
+            Due to the current problem of having signals not acting on the remote
+            shell, you can also do '-o' output mode. If you choose this option,
+            the script will not connect you to the session, but will instead
+            print out the raw command that you can enter yourself. The script can
+            then still be used as a friendly menu-chooser, but you launch the
+            actual session separately yourself.
+
+
+            Requirements
+            - python 3.6
+                - 'boto3' library
+                - 'enquiries' library
+            - AWS profile with appropriate IAM perms to connect via Session Manager
+            - AWS CLI tool that can connect you via Session Manager
+                - "aws ssm session-manager --target INSTANCE_ID" works
+            - The target instance must have the SessionManager Agent installed
+            - The target instance must have IAM perms suitable for the SM Agent
+            - The target AWS account needs to have System Manager activated
+
+            Limitations
+            - EC2 lookup currently isn't paginated, so if you have a lot of
+              instances, it might not be found
+
+        '''))
+
+    parser.add_argument('filter', help='String to filter names on', nargs='?', default=None)
+    parser.add_argument('-i', '--instance', help='instance by ID', default=None)
+    parser.add_argument('--profile', help='AWS profile', default=None)
+    parser.add_argument('--region', help='AWS region', default='ap-southeast-2')
+    parser.add_argument('-o', '--output', help='output mode - print command rather than connect session', action='store_true')
+
+    parser.add_argument('-q', '--quiet', help='sets loglevel=ERROR, good for cron', action='store_true')
+    parser.add_argument('--loglevel', help='', default='INFO')
+    parser.add_argument('--debug', help='overrides other loglevels', action='store_true')
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+    finally:
+        if options.quiet:
+            options.loglevel = logging.ERROR
+        if options.debug:
+            print("logging set to debug")
+            options.loglevel = logging.DEBUG
+
+    #print(vars(options))
+
+    return options
+
+def select_instance(session, ssm, options):
+
+        #inventory = ssm.get_inventory()['Entities']
+        response = ssm.get_inventory()
+        inventory = response['Entities']
+        while 'NextToken' in response:
+            response = ssm.get_inventory(NextToken=response['NextToken'])
+            inventory.extend(response['Entities'])
+
+
+
+        # not all results have 'Data' and we'll get a KeyError if we don't filter them out first
+        instances = [ x for x in inventory if x['Data'] ]
+        targets = [ x['Id'] for x in instances if x['Data']['AWS:InstanceInformation']['Content'][0]['AgentType'] == 'amazon-ssm-agent' ]
+
+        if not targets:
+            log.error('No suitable targets were found for use with SessionManager. Aborting')
+            sys.exit(8)
+
+        ec2 = session.resource('ec2')
+        target_dict = {}
+        # We want to get a list of available instances and present them by Name tag, or by InstanceId if there is no Name
+        for target in targets:
+            i = ec2.Instance(target)
+            log.debug(i.tags)
+            try:
+                tag = [ x['Value'] for x in i.tags if x['Key'] == 'Name' ][0]
+            except:
+                tag = None
+            log.debug(tag)
+
+            if not tag:
+                tag = target
+
+            if options.filter:
+                if options.filter.lower() not in tag.lower():
+                    continue
+
+            # 'enquiries' will choose a dict based on key, which is why this looks backwards
+            target_dict[tag] = target
+
+        if not target_dict:
+            log.error("No suitable targets were found that match filter '%s'. Aborting", options.filter)
+            sys.exit(9)
+
+        response = enquiries.choose('Which instances shall we connect to?', target_dict)
+
+        target = target_dict[response]
+
+        return target
+
+def main():
+    """ ... main?
+    """
+
+    options = get_options()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+    log.debug(options)
+
+    # boto3 can handle profile=None, and will pick up on env vars
+    session = boto3.Session(profile_name=options.profile, region_name=options.region)
+    ssm = session.client('ssm')
+
+
+    if options.instance == None:
+        options.instance = select_instance(session, ssm, options)
+
+
+    # awscli can't handle profile=None, so we need to remove the option if we're using env vars
+    if options.profile:
+        command = "aws --profile %s --region %s ssm start-session --target %s" % (options.profile, options.region, options.instance)
+    else:
+        command = "aws --region %s ssm start-session --target %s" % (options.region, options.instance)
+    log.debug(command)
+    if options.output:
+        log.info('Use the following command to connect to your instance:')
+        print('\033[1;37m' + command +'\033[0m')
+    else:
+        log.warning('\033[1;33mSignals will not necessarily apply to the remote shell when connecting with this wrapper script.\033[0m')
+        log.warning('\033[1;33mBe careful with things like ctrl+C (to be fixed)\033[0m')
+        log.info('Run the script with the -o option to be given the raw command to connect safely')
+        subprocess.call(command, shell=True)
+
+
+
+if __name__ == '__main__':
+    main()

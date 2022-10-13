@@ -26,3 +26,5 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | s3-static-sote-update-redirects | s3 static websites have a page redirection engine. this script is used to update the rules list |
 | ses-smtp-conv.sh        | convert your IAM user/secret into SES user/secret for SMTP usage |
 | sshe                    | ssh into an ECS host running a service with the nominated string |
+| ssm-connect             | connect to your ssm-capable EC2 instances via a friendly TUI list |
+
