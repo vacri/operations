@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+""" Given an s3 location, pull the sql dumps and try to validate them by
+    restoring them to a temporary DB. Fish the various settings out of
+    AWS Parameter Store
+"""
+# TODO: support direct streaming from s3 (without copying to disk first)
+# TODO: support compressed dumps (.sql.gz)
+# TODO: support psql
+# MAYBE: support manually-supplied AWS keys with args
+# MAYBE: support restoredb location outside of Parameter
+
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import time
+## add this line if we start using common in-house libs
+#sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
+from urllib.parse import urlparse
+from datetime import datetime, timedelta, timezone
+import subprocess
+import tempfile
+import smtplib
+from email.message import EmailMessage
+import requests
+import boto3
+import mysql.connector
+#try:
+#    from slackclient import SlackClient
+#except:
+#    # 'slackclient' installs a different module name in v2+
+#    # and has a different workflow
+#    import slack
+from slack import WebClient
+import pkg_resources
+
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+
+def getoptions():
+    """ ... gets... options?
+    """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              rds-db-backup-tester s3://mybucket/path/to/sqldumps
+
+            rds-db-backup-tester is a companion script to rds-db-backup, which
+            connects to correctly-tagged RDS instances, dumps every database
+            inside, and posts these to S3. That script does not rotate
+            filenames, instead relying on S3's 'versioning' to provide cycling
+            of backups.
+
+            This rds-db-backup-tester script looks for all items in the s3
+            location provided that end with .sql, takes those, and attempts to
+            load them into a nominated temporary SQL database to prove that
+            they are valid.  Initially this script only supports MySQL since
+            that's the only database in use here.
+
+            A Prometheus textfile will also be written for the Prometheus
+            NodeExporter to pick up (which isn't configured yet). Until
+            Prometheus is working, the script will alert Slack instead.
+
+            SQL dumps older than 30 days (default) will also be ignored, with
+            the assumption that live databases are backed up more often than
+            this.
+
+            There is an exclusion list where you can put dumpfile names to
+            be ignored, if you know ahead of time that they won't restore
+            with a generic command (eg: require SUPER privs or have very
+            long lines)
+
+            Despite the name, there is no strict dependency on RDS.
+
+            Requirements:
+            - SQL details in AWS Parameter Store (host/port/user/pass/dbname)
+                - creds must be able to create/drop/restore the 'dbname'
+                - /admin/backups/rds/ENGINE/testrestore/ITEM
+                  - ENGINE = mysql
+                  - ITEM = db, host, pass, port, user
+                - /admin/backups/slack-notify-token and /slack-notify-channel
+                - /admin/notifications/mail/[smtp_user|pass|host|port, dest_address]
+            - disk space to temporarily hold dumps
+            - aws tools
+            - slack tools
+            - write perms to Prometheus textfile location
+
+            Suggestion:
+            - run as 'prometheus' user, for easier perms writing to the
+              textfile collector dir (same user as node_exporter)
+
+            Limitations:
+            - Only has MySQL support
+            - identifies sql dumps by the extension '.sql'
+            - no support for compressed files
+            - s3 pagination not implemented - don't use for locations with
+                more than 999 files (any kind, not just .sql) :)
+            - assumes that each sql dumpfile has a unique basename
+
+        '''))
+
+    parser.add_argument('s3_loc', help='', default='help')
+    parser.add_argument('-r', '--region', help='', default='ap-southeast-2')
+    parser.add_argument('-e', '--engine', help='sql engine', default='mysql')
+    #parser.add_argument('-B', '--BOOLEAN', help='', action='store_true')
+    parser.add_argument('-l', '--loglevel', help='', default='INFO')
+    parser.add_argument('-m', '--max-age', help='max age of dumpfiles to be tested', default=30)
+    parser.add_argument('--ssm-prefix',
+                        help='SSM key prefix for temp db credentials',
+                        default='/admin/backups/rds/mysql/testrestore'
+                       )
+    parser.add_argument('--textfile-dir',
+                        help='location to place prometheus textfile for collection by node_exporter',
+                        default='/var/lib/prometheus/node-exporter'
+                       )
+    parser.add_argument('-s', '--suppress-notifications',
+                        help='block updates to slack, prometheus',
+                        action='store_true'
+                       )
+    # should this file contain s3 full key paths instead of just the sql filenames?
+    parser.add_argument('--exclusion-list',
+                        help='file with a simple list of db names to exclude',
+                        default='/etc/rds-db-backup-tester.exclusions'
+                       )
+    parser.add_argument('--ssm-email-prefix',
+                        help='SSM key prefix for alert mail settings',
+                        default='/admin/notifications/mail'
+                       )
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+
+
+    try:
+        res = urlparse(options.s3_loc, allow_fragments=False)
+        options.bucket = res.netloc
+        options.key = res.path.lstrip('/')
+        if res.scheme != 's3':
+            raise ValueError("Scheme '%s' not supported" % res.scheme)
+    except Exception as e:
+        print("ERROR: Unable to parse '%s', exiting: %s" % (options.s3_loc, e))
+        sys.exit(17)
+
+
+    log.debug(options)
+
+    return options
+
+
+
+def get_aws_region():
+    """ stupid AWS region problem
+    """
+
+    r = requests.get("http://169.254.169.254/latest/dynamic/instance-identity/document")
+    response_json = r.json()
+    region = response_json.get('region')
+
+    return region
+
+
+def notify_slack(options, message):
+    """ notify a slack channel with a message
+
+        the 'slackclient' module doesn't differentiate when installing, but
+        'imports' with different names, and has completely different workflows.
+
+        this means we can't rely on any particular behaviour if we don't know
+        we're on a recent slackclient sdk
+    """
+
+    ## this was a workaround to get the script working with both the old and new forms of slack lib, on VMs with different versions available
+    #slack_major = pkg_resources.get_distribution('slackclient').version[0]
+
+    #if int(slack_major) < 2:
+    #    sc = SlackClient(options.slack_token)
+    #    result = sc.api_call("chat.postMessage",
+    #                         channel=options.slack_channel,
+    #                         text=message
+    #                        )
+    #else:
+    #    client = slack.WebClient(options.slack_token)
+    #    result = client.chat_postMessage(channel=options.slack_channel, text=message)
+
+    sc = WebClient(options.slack_token)
+
+    result = sc.api_call(
+                        api_method="chat.postMessage",
+                        params={
+                                'channel': options.slack_channel,
+                                'text': message
+                               }
+                        )
+
+
+
+    if not result['ok']:
+        log.error("Failed to send slack message: %s", result['error'])
+
+
+
+def ssm_fetch_value(key, region=False):
+    """ given a key, return the value from Parameter Store
+    """
+
+    if not region:
+        region = get_aws_region()
+
+    ssm = boto3.client('ssm', region_name=region)
+
+    log.debug('Fetching %s from Parameter Store', key)
+    value = ssm.get_parameter(Name=key)['Parameter']['Value']
+
+    return value
+
+
+
+def list_sql_dumpfiles(bucket, key, age_limit=None):
+    """ search an s3 location for files ending in .sql
+        age_limit in days will exclude older items
+
+        example obj record
+        {'ETag': '"02ccfe7f93b7b9186ac9d881965f268e-1"',
+         'Key': 'rds/mysql/lkg-mysql-production.ceftnf3lxzbv.ap-southeast-2.rds.amazonaws.com/microservices_prod.sql',
+         'LastModified': datetime.datetime(2019, 9, 2, 10, 17, 5, tzinfo=tzutc()),
+         'Size': 54572,
+         'StorageClass': 'STANDARD'},
+    """
+
+    s3 = boto3.client('s3')
+
+    dumpfile_objs = []
+    api_count = 0
+
+    # link describes using continuation tokens (we want full objs for timestamp, not just keys, though)
+    # https://alexwlchan.net/2017/07/listing-s3-keys/
+    kwargs = {'Bucket': bucket, 'Prefix': key}
+    while True:
+        response = s3.list_objects_v2(**kwargs)
+        try:
+            objlist = [x for x in response['Contents'] if x['Key'].lower().endswith('.sql')]
+        except KeyError:
+            log.error("No sql dumps found at '%s' - is this prefix correct? Aborting.", key)
+            sys.exit(38)
+
+
+        dumpfile_objs.extend(objlist)
+
+        try:
+            kwargs['ContinuationToken'] = response['NextContinuationToken']
+            api_count += 1
+        except KeyError:
+            break
+
+    if api_count > 3:
+        log.warning("Had to poll s3 %d times (~1000 keys per time). Please consider narrowing search with a tighter bucket URL (s3://bucket/dbs/foo instead of s3://bucket) - cheaper and faster", api_count)
+
+    if age_limit:
+        stale_date = datetime.now(timezone.utc) - timedelta(days=age_limit)
+        dumpfile_keys = [x['Key'] for x in dumpfile_objs if x['LastModified'] > stale_date]
+    else:
+        dumpfile_keys = [x['Key'] for x in dumpfile_objs]
+
+    return dumpfile_keys
+
+
+
+def fetch_mysql_details(options):
+    """ fetch db connection details from AWS parameter store
+    """
+    mysql_details = {}
+    for thing in ['host', 'port', 'user', 'pass', 'db']:
+        try:
+            mysql_details[thing] = ssm_fetch_value('/'.join([options.ssm_prefix.rstrip('/'), thing]), region=options.region)
+        except Exception as e:
+            log.error("Failed to fetch mysql credentials '%s' from AWS Parameter Store, aborting: %s", thing, e)
+            sys.exit(18)
+
+    return mysql_details
+
+
+
+def check_mysql_version(mysql_details):
+    """ log a warning if restore db is older than (current at time of writing)
+        prod dbs
+    """
+
+    min_version = 8
+
+    cnx = mysql.connector.connect(
+        host=mysql_details['host'],
+        port=mysql_details['port'],
+        user=mysql_details['user'],
+        passwd=mysql_details['pass']
+        )
+    cursor = cnx.cursor()
+    cursor.execute('select version();')
+    for row in cursor:
+        semver = row[0]
+        if int(semver[0]) < min_version:
+            log.warning("Restore database is on MySQL %s, which is lower than some of our dbs (v8.0+)", semver)
+    cnx.close()
+
+
+def process_mysql_dumpfiles(options, mysql_details, tmpdir):
+    """ get mysql dumpfiles and try to verify them by restoring them
+    """
+
+    failed_dumps = []
+    attempted_dumps = 0
+    skipped_dumps = 0
+    dumpfile_keys = list_sql_dumpfiles(options.bucket, options.key, age_limit=options.max_age)
+
+    s3r = boto3.resource('s3')
+    bucket = s3r.Bucket(options.bucket)
+    log.info('Fetching dumpfiles from %s', options.bucket)
+
+    if os.path.isfile(options.exclusion_list):
+        with open(options.exclusion_list, 'r') as f:
+            content = f.readlines()
+            exclusion_list = [x.strip() for x in content]
+    else:
+        exclusion_list = []
+
+    for key in dumpfile_keys:
+        dumpfile = os.path.basename(key)
+
+        if dumpfile in exclusion_list:
+            log.info("Skipping '%s' (in exclusion list)", dumpfile)
+            skipped_dumps += 1
+            continue
+
+        localfile = '/'.join([tmpdir.rstrip('/'), 'restoretest.sql'])
+
+        log.info('Validating %s...', dumpfile)
+
+        log.debug('Downloading %s to %s...', dumpfile, localfile)
+        bucket.download_file(key, localfile)
+
+        try:
+            log.debug('Restoring %s...', dumpfile)
+            attempted_dumps += 1
+            test_mysql_dumpfile(mysql_details, localfile)
+        except subprocess.CalledProcessError:
+            # the mysql restore prints useful error logs. The python exception is just "returned nonzero"
+            log.error("MySQL exited nonzero trying to restore '%s'; mysql should have printed the error above", dumpfile)
+            failed_dumps.append(key)
+
+
+
+    return len(dumpfile_keys), attempted_dumps, failed_dumps, skipped_dumps
+
+
+
+def test_mysql_dumpfile(mysql_details, dumpfile):
+    """ tries a db restore
+    """
+
+    log.debug('Zapping test db')
+    zap_mysql_db(mysql_details)
+
+    # https://stackoverflow.com/a/28266325/4719191 - "low memory" method
+    with open(dumpfile, 'r') as df:
+
+        # supply password as env var to avoid 'omg! cli passwd!' spam
+        command = ['mysql',
+                   '-h', mysql_details['host'],
+                   '-P', str(mysql_details['port']),
+                   '-u', mysql_details['user'],
+                   mysql_details['db']
+                  ]
+                   #'-p' + mysql_details['pass'],
+
+        try:
+            log.debug('Restoring dumpfile...')
+            subprocess.check_call(command, stdin=df, env=dict(os.environ, MYSQL_PWD=mysql_details['pass']))
+        finally:
+            log.debug('Zapping test db')
+            zap_mysql_db(mysql_details)
+
+
+
+def zap_mysql_db(mysql_details):
+    """ destroys the db and creates an empty one
+        needs a user with perms, naturally
+    """
+
+
+    cnx = mysql.connector.connect(
+        host=mysql_details['host'],
+        port=mysql_details['port'],
+        user=mysql_details['user'],
+        passwd=mysql_details['pass']
+        )
+
+    cursor = cnx.cursor()
+
+    # can't string these two sql commands together with multi=True;
+    # if the first fails (eg: no pre-existing db), the second is not run
+    log.debug("Dropping db '%s'...", mysql_details['db'])
+    sql = "DROP DATABASE IF EXISTS %s;" % mysql_details['db']
+    cursor.execute(sql)
+    log.debug("Creating db '%s' again...", mysql_details['db'])
+    sql = "CREATE DATABASE %s;" % mysql_details['db']
+    cursor.execute(sql)
+
+    cnx.close()
+
+
+
+def write_prometheus_textfile(options, total_dumps, attempted_dumps, failed_dumps, skipped_dumps, validation_seconds, engine='mysql'):
+    """ plonk some stats into a textfile for collection by node_exporter,
+        for Prometheus to pick up (using 'textfile collector' method)
+    """
+
+    content = """\
+#HELP rds_backup_tester_{engine}_total_dumps Total {engine} dumps found for verification
+#TYPE rds_backup_tester_{engine}_total_dumps gauge
+rds_backup_tester_{engine}_total_dumps{{bucket="{bucket}",prefix="{prefix}"}} {total_dumps}
+
+#HELP rds_backup_tester_{engine}_attempted_dumps Attempted verifications for {engine} dumps
+#TYPE rds_backup_tester_{engine}_attempted_dumps gauge
+rds_backup_tester_{engine}_attempted_dumps{{bucket="{bucket}",prefix="{prefix}"}} {attempted_dumps}
+
+#HELP rds_backup_tester_{engine}_failed_dumps Failed verifications for {engine} dumps
+#TYPE rds_backup_tester_{engine}_failed_dumps gauge
+rds_backup_tester_{engine}_failed_dumps{{bucket="{bucket}",prefix="{prefix}"}} {failed_dumps}
+
+#HELP rds_backup_tester_{engine}_skipped_dumps Skipped verifications for {engine} dumps
+#TYPE rds_backup_tester_{engine}_skipped_dumps gauge
+rds_backup_tester_{engine}_skipped_dumps{{bucket="{bucket}",prefix="{prefix}"}} {skipped_dumps}
+
+#HELP rds_backup_tester_{engine}_validation_seconds Total duration for {engine} backup dumps validation
+#TYPE rds_backup_tester_{engine}_validation_seconds gauge
+rds_backup_tester_{engine}_validation_seconds{{bucket="{bucket}",prefix="{prefix}"}} {validation_seconds}
+""".format(engine=engine,
+           total_dumps=total_dumps,
+           attempted_dumps=attempted_dumps,
+           failed_dumps=failed_dumps,
+           validation_seconds=validation_seconds,
+           skipped_dumps=skipped_dumps,
+           bucket=options.bucket,
+           prefix=options.key.rstrip('/')
+          )
+
+    log.debug('Creating node_exporter dir, if needed')
+    os.makedirs(options.textfile_dir, mode=0o755, exist_ok=True)
+    textfile = '/'.join([options.textfile_dir.rstrip('/'), 'rds-db-backup-tester_%s_%s_%s.prom' % (engine, options.bucket, options.key.rstrip('/').replace('/', '-'))])
+
+    log.debug('Writing textfile for node_exporter collection')
+    with open(textfile, 'w') as f:
+        f.write(content)
+
+
+
+def send_alerts(options, failed_dumps, attempted_dumps, failed_dump_list=None, message='no message supplied', engine='mysql'):
+    """ send alerts to alerty targets
+    """
+    log.info('Sending Slack alert...')
+    try:
+        send_slack_alert(options,
+                         failed_dumps,
+                         attempted_dumps,
+                         message=message,
+                         engine=engine
+                        )
+    except Exception as e:
+        log.error('Failed to send alert to slack: %s', e)
+    log.info('Sending mail alert...')
+    try:
+        send_mail_alert(options,
+                        failed_dumps,
+                        attempted_dumps,
+                        failed_dump_list=failed_dump_list,
+                        message=message,
+                        engine=engine
+                       )
+    except Exception as e:
+        log.error('Failed to send alert to mail: %s', e)
+
+
+def send_mail_alert(options, failed_dumps, attempted_dumps, failed_dump_list=None, message='no message supplied', engine='mysql'):
+    """ alert mail on failed dumps
+    """
+
+    try:
+        smtp_host = ssm_fetch_value(options.ssm_email_prefix + '/smtp_host')
+        smtp_port = ssm_fetch_value(options.ssm_email_prefix + '/smtp_port')
+        smtp_user = ssm_fetch_value(options.ssm_email_prefix + '/smtp_user')
+        smtp_pass = ssm_fetch_value(options.ssm_email_prefix + '/smtp_pass')
+        dest_address_list = ssm_fetch_value(options.ssm_email_prefix + '/dest_address_list').split(',')
+    except Exception as e:
+        log.error('Failed to retrieve parameter from Parameter Store: %s', e)
+
+
+    if failed_dump_list:
+        summary = '\n\nS3 keys (dumpfiles) failing sql restore/validation:\n - %s' % '\n - '.join(failed_dump_list)
+
+        message = message + summary
+
+    msg = EmailMessage()
+    msg['Subject'] = 'SQL dump verification alert on %s' % os.uname().nodename
+    msg['From'] = smtp_user
+    msg['To'] = dest_address_list
+    msg.set_content(message)
+    log.debug(msg)
+
+    server = smtplib.SMTP(smtp_host, smtp_port)
+    server.starttls()
+    server.login(smtp_user, smtp_pass)
+    server.send_message(msg)
+    server.quit()
+
+
+def send_slack_alert(options, failed_dumps, attempted_dumps, message='no message supplied', engine='mysql'):
+    """ alert Slack on failed dumps
+    """
+
+    options.slack_channel = ssm_fetch_value('/admin/backups/slack-notify-channel', region=options.region)
+    options.slack_token = ssm_fetch_value('/admin/backups/slack-notify-token', region=options.region)
+
+    #message = "SQL dump verification script on '%s' failed to verify %d sql dump(s) (of %d) from %s - check logs for more details" % (os.uname().nodename, failed_dumps, attempted_dumps, options.s3_loc)
+
+    log.debug('Sending slack message...')
+    notify_slack(options, message)
+
+
+
+def main():
+    """ ... main?
+    """
+
+    options = getoptions()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+    log.info("Let's start validating some sql dumps by trying to restore them!")
+
+    mysql_details = fetch_mysql_details(options)
+    log.debug("MySQL creds from Parameter Store: %s", mysql_details)
+    try:
+        check_mysql_version(mysql_details)
+    except Exception as e:
+        log.error("Problem checking mysql version, aborting: %s", e)
+        sys.exit(43)
+
+    mysql_start_time = time.time()
+
+    # this should auto-cleanup the directory after it's all done
+    with tempfile.TemporaryDirectory() as tmpdir:
+        log.debug("Temp dir: %s", tmpdir)
+
+        mysql_total_dumps, mysql_attempted_dumps, mysql_failed_dumplist, mysql_skipped_dumps = process_mysql_dumpfiles(options, mysql_details, tmpdir)
+
+        mysql_numfailed = len(mysql_failed_dumplist)
+
+    mysql_end_time = time.time()
+    mysql_validation_seconds = int(mysql_end_time - mysql_start_time)
+
+    if not options.suppress_notifications:
+        try:
+            write_prometheus_textfile(options,
+                                      mysql_total_dumps,
+                                      mysql_attempted_dumps,
+                                      mysql_numfailed,
+                                      mysql_skipped_dumps,
+                                      mysql_validation_seconds,
+                                      engine='mysql'
+                                     )
+        except Exception as e:
+            log.error('Failed to write Prometheus/node-exporter textfile: %s', e)
+
+        ## Only send a notification on failure
+        ## TODO: if this script itself is failing, that should be caught in a Prometheus alert (on stale data)
+        if mysql_numfailed > 0:
+            message = "SQL dump verification script on '%s' failed to verify %d sql dump(s) (of %d) from %s - check logs for more details" % (os.uname().nodename, mysql_numfailed, mysql_attempted_dumps, options.s3_loc)
+            send_alerts(options,
+                        mysql_numfailed,
+                        mysql_attempted_dumps,
+                        failed_dump_list=mysql_failed_dumplist,
+                        message=message,
+                        engine='mysql'
+                       )
+
+
+
+    if mysql_numfailed > 0:
+        log.error('S3 keys (dumpfiles) failing sql restore/validation:\n - %s',
+                  '\n - '.join(mysql_failed_dumplist)
+                 )
+    log.info("%d/%d/%d/%d total/attempted/failed/skipped mysql validations (took %s)",
+             mysql_total_dumps,
+             mysql_attempted_dumps,
+             mysql_numfailed,
+             mysql_skipped_dumps,
+             str(timedelta(seconds=mysql_validation_seconds))
+            )
+
+
+if __name__ == '__main__':
+    main()

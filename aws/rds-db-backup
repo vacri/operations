@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+""" 1) find RDS host servers to back up by tag
+    2) figure out if mysql or psql (edit: psql support axed)
+    3) grab 'backup user' creds for hosts from Parameter Store
+    3a) grab backup target s3 location from s3 tags ('rds-backup:True')
+    4) connect to db and query for list-o-dbs
+    5) dump individual dbs
+    6) stream-compress and stream-upload dumps to s3 (edit: compression not implemented)
+    7) notify slack of success or of problems
+
+    verification component
+    a) grab backup target s3 location from Parameter Store
+    a1) grab test db host location from Parameter Store
+    b) find all dumps in this location
+    c) do a test restore of each of these dumps to the test location
+    d) drop the db after each test
+
+    note: 'find s3 bucket by tag' (as is used in the s3 backup script) was
+    replaced with using an SSM parameter, since it's super-slow. We need to use
+    SSM parameters anyway for the db user/pass
+"""
+
+#from __future__ import print_function
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import socket
+import subprocess
+import requests
+import boto3
+from botocore.exceptions import ClientError
+#from slackclient import SlackClient
+from slack import WebClient
+import mysql.connector
+import smart_open
+#import gzip
+#import zlib
+#import psycopg2
+
+
+# TODO: rework this klunky boilerplate
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+formatter = logging.Formatter('%(levelname)s: %(message)s')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+            Usage:
+                rds-db-backup [-d] [-v] go
+
+            In cron:
+                rds-db-backup go 2>&1 | logger -t rds-db-backup
+
+            rds-db-backup will look through the rds host list for buckets marked with the tag
+            "rds-db-backup:True", and then back up individual dbs on those hosts to this location:
+
+                s3://BACKUP_BUCKET/rds/DBTYPE/RDSNAME
+
+            It is expected that the "BACKUP_BUCKET" bucket has versioning turned on - this script
+            will not handle backup file rotation, as it is expected that s3 versioning will
+            handle this.
+
+            This backup script is written with the expectation that AWS perms will come from
+            server roles, though of course any awscli-compatible perms will work.
+
+
+            The script expects to find passwords in AWS Parameter Store in the following location,
+            where DBTYPE is 'mysql', 'postgres', etc (as per RDS 'engine' field) and the RDSNAME
+            is either 'global' (intended for a common backups user) or the RDS instance name if
+            there's a custom backup user for that server
+            /admin/backups/rds/DBTYPE/RDSNAME/backups_username
+            /admin/backups/rds/DBTYPE/RDSNAME/backups_password
+
+
+            REQUIREMENTS:
+            - Correct values in AWS Parameter Store as listed above
+            - The relevant user created in the database
+            - The appropriate tag on the db instance in RDS, so the script can find it
+
+            LIMITATIONS:
+            - This script assumes env-supplied credentials (IAM server roles/env vars/user env),
+              and is not intended to handle explicit IAM keys/secrets
+            - Assumes a single backup bucket, and hardcodes the key prefix to "rds/mysql" or "rds/psql".
+            - needs IAM permissions to read backup user credentials out of Parameter Store
+            - needs IAM permissions to read Slack credentials out of Parameter Store, if you
+              want to notify Slack
+            - Compression is NOT working. Tried to use stream compression (want to avoid hitting the
+              filesystem), but am getting double-compressed files. Not sure why. FIXME
+            - After some initial investigation, the script won't support postgres backups - there
+              isn't a simple way to do a global backup user for dumping individual dbs in psql. As
+              we only have one db in psql and we want to get rid of that anyway (xwiki), it's not worth
+              chasing down
+
+        '''))
+
+    parser.add_argument('go',
+        help="all my potentially destructive scripts require an arg or they won't run, even if they don't 'need' an arg :)",
+        default='help')
+    parser.add_argument('-d', '--dry-run', help='run sync in dry-run mode', action='store_true')
+    parser.add_argument('-t', '--backup-tag-key', help='rds tag key to find RDS instances to back up', default='rds-backup')
+    parser.add_argument('-T', '--backup-tag-value', help='rds tag value to find RDS instances to back up (case insensitive)', default='True')
+    parser.add_argument('-b', '--backup-bucket', help="AWS Parameter Store key to fetch, or describe bucket name directly prefixed with s3://",
+        default='/admin/backups/rds/backup-bucket')
+    parser.add_argument('-r', '--region', help='manually set AWS region', default=False)
+    parser.add_argument('-s', '--suppress-notification', help='suppress Slack notification', action='store_true')
+
+
+    options = parser.parse_args()
+
+    if options.go != 'go':
+        parser.print_help()
+        sys.exit()
+
+    options.ip = get_ip()
+    options.account_id = boto3.client('sts').get_caller_identity().get('Account')
+    if not options.region:
+        options.region = get_aws_region()
+
+    if options.dry_run:
+        log.info('DRYRUN enabled')
+        options.suppress_notification = True
+
+    # treat as s3 bucket if right prefix, otherwise assume it's a Parameter Store key
+    if options.backup_bucket.startswith('s3://'):
+        options.bucket = options.backup_bucket.split('s3://')[-1]
+    else:
+        try:
+            options.bucket = ssm_fetch_value(options.backup_bucket)
+        except Exception as e:
+            log.error('Failed to fetch backup bucket name from Parameter Store (%s), exiting: %s', options.backup_bucket, e)
+            sys.exit(14)
+
+    if options.suppress_notification:
+        log.info('Slack notifications suppressed')
+        options.slack = False
+    else:
+        try:
+            options.slack_token = ssm_fetch_value('/admin/backups/slack-notify-token')
+            options.slack_channel = ssm_fetch_value('/admin/backups/slack-notify-channel')
+            options.slack = True
+        except:
+            log.warning("Failed to retrieve all Slack details from Parameter Store, slack notification disabled")
+            options.slack = False
+
+
+
+    return options
+
+
+#
+# BOILERPLATE FUNCTIONS
+#
+
+
+def get_ip():
+    """ get default localhost ip
+    """
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+
+
+def get_aws_region():
+    """ it is beyond ridiculous how difficult it is to identify the region as you
+        are running in it seems like the most obvious thing for Boto to support,
+        given 'region' is a frequent mandatory arg
+    """
+
+    r = requests.get("http://169.254.169.254/latest/dynamic/instance-identity/document")
+    response_json = r.json()
+    region = response_json.get('region')
+
+    return region
+
+
+
+def ssm_fetch_value(key, region=False):
+    """ given a key, return the value from Parameter Store
+    """
+
+    if not region:
+        region = get_aws_region()
+
+    ssm = boto3.client('ssm', region_name=region)
+
+    value = ssm.get_parameter(Name=key)['Parameter']['Value']
+
+    return value
+
+
+
+def notify_slack(options, message, level='info'):
+    """ notify a slack channel with a message
+    """
+
+    if options.slack:
+        #sc = SlackClient(options.slack_token)
+        sc = WebClient(options.slack_token)
+
+        result = sc.api_call(
+            api_method="chat.postMessage",
+            params={
+                'channel': options.slack_channel,
+                'text': message
+            }
+        )
+
+        if not result['ok']:
+            log.error("Failed to send slack message: %s", result['error'])
+
+
+
+def check_bucket_read(bucket_name):
+    """ this is quick'n'dirty. The internet seems to think that
+        all you need is a 'head bucket' operation, but getting a
+        bucket 'head' has different IAM perms than getting bucket
+        objects...
+    """
+
+    s3r = boto3.resource('s3')
+    #bucket = s3.Bucket(bucket_name)
+    try:
+        s3r.meta.client.head_bucket(Bucket=bucket_name)
+        return True
+    except ClientError as e:
+        error_code = int(e.response['Error']['Code'])
+        if error_code == 403:
+            log.debug("Bucket location forbidden - unable to access, regardless of whether it exists")
+            return False
+        elif error_code == 404:
+            log.debug("Bucket '%s' does not exist", bucket_name)
+            return False
+        else:
+            log.error('Unexpected error: %s', e)
+
+
+
+def check_bucket_write(bucket_name):
+    """ this is quick'n'dirty, but it seems to be what AWS does to check write
+        access (eg: testing log delivery)
+    """
+
+    s3c = boto3.client('s3')
+
+    # prefix here must match IAM write perms on intended backup bucket
+    testfile = 'rds/s3-bucket-write-access-testfile'
+
+    put_object = False
+    try:
+        s3c.put_object(
+            Bucket=bucket_name,
+            Body='This is a test file for checking write access for the rds backup script. It should have been deleted. Something has probably gone wrong',
+            Key=testfile
+        )
+        put_object = True
+    except:
+        log.debug('Failure trying to write a testfile to %s; this (probably) means no write access', bucket_name)
+        return False
+
+    # cleanup
+    if put_object:
+        try:
+            s3c.delete_object(
+                Bucket=bucket_name,
+                Key=testfile
+            )
+        except Exception as e:
+            log.warning('Could write testfile to %s to check write access, but had error on removal: %s', bucket_name, e)
+
+    return True
+
+
+
+def check_bucket_readwrite_perms(bucket_name):
+    """ This is quick'n'dirty, not canonical
+    """
+
+    read = check_bucket_read(bucket_name)
+    write = check_bucket_write(bucket_name)
+
+    if read:
+        if write:
+            return 'write'
+        else:
+            return 'read'
+    else:
+        if write:
+            return 'write-only'
+        else:
+            return 'none'
+
+
+
+def check_versioning_on_bucket(bucket):
+    """ Check if Versioning is enabled on the bucket
+        1) key 'Status' is present if it is
+        2) and has a value of 'Enabled' (Versioning can't be removed, but can be disabled)
+    """
+
+    s3c = boto3.client('s3')
+    versioning = s3c.get_bucket_versioning(Bucket=bucket)
+
+    versioning_enabled = False
+    try:
+        if versioning['Status'] == 'Enabled':
+            versioning_enabled = True
+    except:
+        pass
+
+    return versioning_enabled
+
+
+
+#
+# SCRIPT FUNCTIONS
+#
+
+def s3_check_backup_bucket_settings(backup_bucket):
+    """ just check a couple of settings to ensure bucket suitability
+    """
+
+    if check_versioning_on_bucket(backup_bucket):
+        log.debug('Versioning enabled on backups bucket')
+    else:
+        log.warning('Versioning is not enabled on the backups bucket. This is bad - turn it on!')
+
+    if check_bucket_readwrite_perms(backup_bucket) not in ['write', 'write-only']:
+        log.error("No permissions to write to backup bucket '%s'. Aborting.", backup_bucket)
+        sys.exit(9)
+
+    return True
+
+
+
+def find_rds_hosts(options):
+    """ find rds hosts by tag
+        annoyingly, the 'describe rds instances' call does NOT describe tags...
+        ... or filter by them...
+
+        this function should create a dict of rds instances separated by engine type:
+        {
+            'mysql': [
+                    (dbdict1),
+                    (dbdict2),
+                    (dbdict...),
+                ],
+            'postgres': [
+                    (dbdicta),
+                    (dbdictb),
+                    (dbdict...)
+                ]
+        }
+    """
+
+    rds = boto3.client('rds', region_name=options.region)
+
+    rds_instances = rds.describe_db_instances()['DBInstances']
+
+    backup_instances = {}
+    for instance in rds_instances:
+        arn = instance['DBInstanceArn']
+        instancetags = rds.list_tags_for_resource(ResourceName=arn)['TagList']
+
+        for tag in instancetags:
+            if tag['Key'] == options.backup_tag_key and tag['Value'].lower() == options.backup_tag_value.lower():
+                if instance['Engine'] not in backup_instances:
+                    backup_instances[instance['Engine']] = []
+
+                log.info('... %s (%s)', instance['DBInstanceIdentifier'], instance['Engine'])
+                backup_instances[instance['Engine']].append(instance)
+
+    return backup_instances
+
+
+
+def get_credentials_from_ssm(engine, dbname):
+    """ fetch backups credentials from canned locations
+    """
+
+    username_key = '/admin/backups/rds/%s/%s/backups-username' % (engine, dbname)
+    password_key = '/admin/backups/rds/%s/%s/backups-password' % (engine, dbname)
+
+    try:
+        log.debug('Fetching %s from Parameter Store...', username_key)
+        username = ssm_fetch_value(username_key)
+        log.debug('Fetching %s from Parameter Store...', password_key)
+        password = ssm_fetch_value(password_key)
+    except:
+        log.debug('Failed to retrieve credentials, setting user/pass to False')
+        username = False
+        password = False
+
+    return username, password
+
+
+
+def fetch_mysql_db_list(address, port, username, password):
+    """ fetch a list of databases from the mysql target host
+    """
+
+    dblist = []
+
+    conn = mysql.connector.connect(
+        user=username,
+        password=password,
+        host=address,
+        port=port
+        )
+
+    cursor = conn.cursor()
+    databases = ("show databases")
+    cursor.execute(databases)
+    for (databases) in cursor:
+        try:
+            # mysql.connector returns a bytearray for mysql 8+
+            db = databases[0].decode('utf8')
+        except:
+            # mysql.connector returns a string for mysql 5.6/5.7
+            db = databases[0]
+        dblist.append(db)
+    conn.close()
+
+    systemdbs = [
+        'mysql',
+        'innodb',
+        'information_schema',
+        'performance_schema',
+        'sys',
+        'tmp'
+        ]
+
+    dblist = [x for x in dblist if x not in systemdbs]
+
+    return dblist
+
+
+
+def stream_mysql_db_backup_to_s3(options, db, address, port, username, password):
+    """ Do the actual backup + stream to s3
+    """
+    # TODO/FIXME: I cannot figure out why the streaming compression creates double-compressed files,
+    # needs more fiddling and testing (probably to filesystem rather than s3)
+
+    # note: no space between -p and the password
+    # we can't use --single-transaction here, as it is InnoDB only, and we have some MyISAM legacy tables
+    dumpcmd = ['mysqldump',
+               '-h', address,
+               '-P', str(port),
+               '-u', username,
+               '-p' + password,
+               '--no-tablespaces',
+               db
+               ]
+
+    #dumptarget = "s3://%s/rds/mysql/%s/%s.sql.gz" % (options.bucket, address, db)
+    dumptarget = "s3://%s/rds/mysql/%s/%s.sql" % (options.bucket, address, db)
+
+    log.debug("Dumping '%s' to s3://%s...", db, options.bucket)
+    with smart_open.open(dumptarget, 'wb') as stream_out:
+        mysqldump = subprocess.Popen(dumpcmd, stdout=subprocess.PIPE)
+
+        ## read/write bytes instead of text lines, no compression
+        while True:
+            data = mysqldump.stdout.read(4096)
+            if not data:
+                break
+
+            stream_out.write(bytes(data))
+
+
+
+        ## no compression version
+        #while True:
+        #    line = mysqldump.stdout.readline()
+        #    if not line:
+        #        break
+
+        #    stream_out.write(line)
+
+        ## zlib compression version. Whether I use the gzip method or the zlib method, I'm getting a double-compressed file
+        ## creates a zlib file in a gzip file :(
+        ## can't figure out why
+        #c = zlib.compressobj()
+        #while True:
+        #    line = mysqldump.stdout.readline()
+        #    if not line:
+        #        stream_out.write(c.flush())
+        #        break
+
+        #    stream_out.write(c.compress(line))
+
+
+        ## gzip compression version. get double-compressed files
+        ## creates a gzip file in a gzip file :(
+        #gz = gzip.GzipFile('', 'wb', 9, stream_out)
+        #while True:
+        #    data = mysqldump.stdout.read(4096)
+        #    if not data:
+        #        break
+        #    gz.write(data)
+        #gz.flush()
+        #gz.close()
+
+
+
+    # https://stackoverflow.com/a/28597557 - but instead of the 'mysql' taking
+    # stdout from 'mysqldump' use the stream upload command instead. Oh, and
+    # gzip at some point
+
+    # subprocessing out to mysqldump seems to be "the way it's done", but it
+    # means we can't run this from an AWS lambda. Maybe an ECS periodic task,
+    # though? I couldn't find info on how to properly dump using python's
+    # mysql.connector, though obviously there's going to be a way, I just don't
+    # want to carve my own path here.
+
+
+
+def backup_mysql_instances(options, instances):
+    """ take a list of rds mysql instances, query each for their list-o-databases,
+        and back them up to s3
+
+        there is expected to be a global backup db user, but you can specify
+        an individual user for a given db if you put an entry in Parameter Store
+    """
+
+    issues = []
+    completed = []
+    log.debug('Fetching global mysql backup credentials from AWS Parameter Store...')
+
+    global_backup_username, global_backup_password = get_credentials_from_ssm('mysql', 'global')
+
+    #log.info('%s, %s', global_backup_username, global_backup_password)
+
+    for instance in instances:
+
+        name = instance['DBInstanceIdentifier']
+        address = instance['Endpoint']['Address']
+        port = instance['Endpoint']['Port']
+
+        # these return 'False' if they don't exist
+        ssm_replace_username, ssm_replace_password = get_credentials_from_ssm('mysql', name)
+
+        if ssm_replace_username and ssm_replace_password:
+            log.debug('Setting user/pass for %s to individual/per-host settings', name)
+            backup_username = ssm_replace_username
+            backup_password = ssm_replace_password
+        else:
+            backup_username = global_backup_username
+            backup_password = global_backup_password
+
+        if not backup_username or not backup_password:
+            log.warning("Could not find credentials (global or per-host) for '%s', skipping backup", name)
+            issues.append("Could not find credentials (global or per-host) for '%s' on Parameter Store" % name)
+            continue
+
+        log.info("Fetching list of databases from '%s'...", name)
+        dblist = []
+        try:
+            dblist = fetch_mysql_db_list(address, port, backup_username, backup_password)
+        except Exception as e:
+            log.error("Problem fetching mysql database list from RDS: %s", e)
+            issues.append("Could not fetch mysql database list for '%s' from RDS, see server logs" % address)
+
+        for db in dblist:
+            try:
+                log.info('Backing up %s on %s to s3://%s/...', db, name, options.bucket)
+                if options.dry_run:
+                    log.info("DRYRUN: would have dumped '%s' to s3...", db)
+                else:
+                    stream_mysql_db_backup_to_s3(options, db, address, port, backup_username, backup_password)
+
+                completed.append(db)
+            except Exception as e:
+                log.error("Problem dumping mysqldb '%s' on %s: %s", db, name, e)
+                issues.append("Problem dumping mysqldb '%s' on %s, see logs" % (db, name))
+
+    return issues, completed
+
+
+
+def fetch_postgres_db_list(address, port, username, password):
+    """ fetch the db listing from pg
+    """
+
+    log.info('Postgres dbs not supported - see Limitations in help text')
+    pass
+
+
+
+def stream_postgres_db_backup_to_s3(options, db, address, port, username, password):
+    """ do the actual backup and stream it to s3
+        lack of compression is in same boat as for mysql
+    """
+
+    log.info('Postgres dbs not supported - see Limitations in help text')
+    pass
+
+
+
+def backup_postgres_instances(options, instances):
+    """ take a list of rds postgres instances, query each for their list-o-databases,
+        and back them up to s3
+
+        there is expected to be a global backup db user, but you can specify
+        an individual user for a given db if you put an entry in Parameter Store
+    """
+
+    log.info('Postgres dbs not supported - see Limitations in help text')
+    pass
+
+
+
+def main():
+    """ ... main?
+    """
+
+    issues = []
+    completed = []
+
+    log.info('Start backing up rds databases...')
+    options = getoptions()
+
+    #log.info('Finding the backup storage bucket by tag...')
+    #options.bucket = find_backup_bucket_by_tag(options)
+    #log.info("... %s", options.bucket)
+
+    log.info("Checking perms on backup bucket '%s'...", options.bucket)
+    s3_check_backup_bucket_settings(options.bucket)
+
+    log.info("Finding rds db instances to back up, with tag '%s':'%s'...",
+        options.backup_tag_key, options.backup_tag_value)
+    backup_instances = find_rds_hosts(options)
+
+    if not backup_instances:
+        issues.append('No databases were found for backup (tagged %s:%s)' %
+                       (options.backup_tag_key, options.backup_tag_value))
+
+    for engine in backup_instances.keys():
+        if engine == 'mysql':
+            mysql_issues, mysql_completed = backup_mysql_instances(options, backup_instances['mysql'])
+            issues.extend(mysql_issues)
+            completed.extend(mysql_completed)
+        elif engine == 'postgres':
+            log.info('Postgres host tagged for backup, but not currently supported - see Limitations in help text')
+            #postgres_issues, postgress_completed = backup_postgres_instances(options, backup_instances['postgres'])
+            #issues.extend(postgres_issues)
+            #completed.extend(postgres_completed)
+        else:
+            log.warning("Databases of type '%s' tagged for backup, but this type is not supported for backup, skipping", engine)
+
+    if issues:
+        log.warning("Issues were encountered during backup run:\n- " + "\n- ".join(issues))
+        notify_slack(options, "<!subteam^SGKKQN4DP> rds-db-backup(%s): encountered issues for RDS tag '%s':\n- " % (options.ip, options.backup_tag_key)
+                               + "\n- ".join(issues))
+
+    if completed:
+        log.info("The following database backups were completed: " + "; ".join(completed))
+        notify_slack(options, "rds-db-backup(%s): backups complete for tag '%s': " % (options.ip, options.backup_tag_key)
+                                + "; ".join(completed))
+    else:
+        # slack notification for 'no dbs found' should be in the 'issues' list and posted above
+        log.warning("No database backups were marked as completed. This is probably bad.")
+
+
+    log.info('Done')
+
+
+
+if __name__ == '__main__':
+    main()

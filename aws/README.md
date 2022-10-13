@@ -18,3 +18,7 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | https_expiry_checker.py | AWS Lambda code for cert expiry checking |
 | r53-ns-compare          | Discover if an R53 zone is live DNS or not |
 | r53-set-record          | Make single r53 records |
+| rds-db-backup           | backs up individual databases from RDS mysql to s3 (native RDS backups = whole machine) |
+| rds-db-backup-tester    | tests mysql backup files by installing to a temp db |
+| rds-db-init             | creates empty dbs on RDS mysql, using lookups from Parameter Store |
+| route53_backup.py       | AWS Lambda code to backup route53 zones to s3 |

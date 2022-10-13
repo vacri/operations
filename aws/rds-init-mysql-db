@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+""" because I'm oh-so-tired of looking up the root passwords and hostnames to manually make dbs
+    python 3.6 required for 'secrets' module
+    also need boto3 and enquiries
+"""
+
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+## add this line if we start using common in-house libs
+#sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
+import string
+import secrets
+import subprocess
+import mysql.connector
+import enquiries
+import boto3
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+
+def get_options():
+    """ ... gets... options?
+    """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              rds-init-mysql-db go
+              rds-init-mysql-db --force-user --namespace paultest --env test go
+              rds-init-mysql-db --gimme-pass go   # gives you the root password for manual intervention
+
+            Requirements:
+            - python 3.6+ (for 'secrets' module)
+            - python module 'enquiries' and 'boto3'
+            - mysql CLI tool if you want to use a seedfile
+            - AWS_PROFILE env var pointing to an MFA-enabled set of creds
+                - must have perms to read and write from Parameter Store
+            - RDS instances with 'mysql' in the name, as well as a string relating to their env
+               - eg: mycompany-mysql-test
+               - we already do this, but otherwise we'd search rds config + tags
+            - Parameter Store vars following the pattern /ENV/rds/RDS_INSTANCE/root-pass
+               - master RDS user is assumed to be 'root'
+
+
+            Because I'm oh-so-tired of looking up root db creds on AWS Parameter Store
+            when creating new client DBs, this little script does the lookup and db
+            initialisation for you. You can provide parameters as args, or the script
+            will do AWS lookups for you and ask you which db you want to use, based on
+            env.
+
+            The script is not really designed for resetting/recreating a database,
+            but you can do that manually - the script has a --gimme-pass option to
+            give you the root pass and hostname so you can manually get in there
+            yourself.
+
+            The script can reset a user, recreating it to suit the parameters
+            read out of Parameter Store. It will not recreate/drop an existing
+            database (maybe later on, if I find I need it). If you want to
+            drop/recreate the db, you'll need to log in manually to drop it
+            (see gimme-pass in the above paragraph)
+
+
+            This script is similar to the LightComet vending machine, but
+            does a little more here and a little less there.
+        '''))
+
+    parser.add_argument('go', help='', default='help') # I always have a mandatory arg on things that can destroy data, even if it does nothing
+    parser.add_argument('-q', '--quiet', help='sets loglevel=ERROR, good for cron', action='store_true')
+    parser.add_argument('--loglevel', help='', default='INFO')
+    parser.add_argument('--debug', help='overrides other loglevels', action='store_true')
+    parser.add_argument('--seedfile', help='path to sql seed file', default=None)
+    parser.add_argument('--force-reset', help='force a reset of the db, even if it already exists', action='store_true')
+    parser.add_argument('--force-user', help='drop and remake the db user', action='store_true')
+    parser.add_argument('-s', '--summarise', help="just summarise, but don't edit mysql. Will still put entries in Paramater Store", action='store_true')
+    parser.add_argument('-d', '--db-host', help='mysql database host (FQDN)', default=None)
+    parser.add_argument('-i', '--db-instance', help='mysql database instance (RDS nickname)', default=None)
+    parser.add_argument('-p', '--db-port', help='mysql database port', default='3306')
+    parser.add_argument('-n', '--namespace', help='namespace/component for the database', default='')
+    parser.add_argument('-r', '--region', help='AWS region', default='ap-southeast-2')
+    parser.add_argument('-e', '--env', help='environment (prod/stag/test)', default=None)
+    parser.add_argument('--gimme-pass', help="just print out the root password, don't set up a client db", action='store_true')
+    parser.add_argument('--substring', help='filter RDS instance names by this substring', default='mysql')
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+    finally:
+        if options.quiet:
+            options.loglevel = logging.ERROR
+        if options.debug:
+            print("logging set to debug")
+            options.loglevel = logging.DEBUG
+
+    #print(vars(options))
+
+    return options
+
+
+def get_longenv(shortenv):
+    """ convert shortenv to longenv
+    """
+
+    if shortenv == 'prod':
+        longenv = 'production'
+    elif shortenv == 'stag':
+        longenv = 'staging'
+    elif shortenv == 'test':
+        longenv = 'testing'
+    else:
+        log.debug('no longenv found for shortenv %s, setting to equal shortenv')
+        longenv = shortenv
+
+    return longenv
+
+
+
+def ssm_fetch_value(key, region=False):
+    """ given a key, return the value from Parameter Store
+    """
+
+    #if not region:
+    #    region = get_aws_region()
+
+    ssm = boto3.client('ssm', region_name=region)
+
+    log.debug('Fetching %s from Parameter Store', key)
+    value = ssm.get_parameter(Name=key)['Parameter']['Value']
+
+    return value
+
+
+
+def fetch_rds_instance_names(substring=None, env=None):
+    """ fetch a list of instance names out of RDS
+    """
+
+    rds = boto3.client('rds')
+    response = rds.describe_db_instances()
+    instance_configs = response['DBInstances']
+    names = [ x['DBInstanceIdentifier'] for x in instance_configs ]
+    if substring:
+        names = [ x for x in names if substring in x ]
+
+    if env == 'test': # our mysql 5.7 has test dbs on the stag host, mysql 8 has a separate test host
+        names = [ x for x in names if 'test' in x or 'stag' in x]
+    else:
+        names = [ x for x in names if env in x]
+
+
+    if not names:
+        log.warning('Could find no RDS instances (env=%s, substring=%s)', env, substring)
+
+    addresses = {}
+    for name in names:
+        addresses[name] = [ x['Endpoint']['Address'] for x in instance_configs if x['DBInstanceIdentifier'] == name ][0]
+
+    return names, addresses
+
+
+
+def fetch_mysql_root_pass_from_ssm(options, env, db_host):
+    """ figure out an ssm key name and return it
+    """
+
+    if env == 'test' and 'stag' in db_host: # testing db/envs are on stag host in our mysql 5.7 setup
+        env = 'stag'
+
+    key = '/' + get_longenv(env) + '/rds/' + db_host + '/root-pass'
+    mysql_root_pass = ssm_fetch_value(key, region=options.region)
+
+    return mysql_root_pass
+
+
+def get_db_creds(options, env, instance, db_name):
+    """ attempt to look up creds in Paramater Store, and generate/put them if they're missing
+    """
+
+    ssm_user_key = '/'.join(['', get_longenv(env), 'rds', instance, db_name, 'user'])
+    ssm_pass_key = '/'.join(['', get_longenv(env), 'rds', instance, db_name, 'pass'])
+    log.debug('ssm_user_key = %s', ssm_user_key)
+    log.debug('ssm_pass_key = %s', ssm_pass_key)
+
+    ssm = boto3.client('ssm', region_name=options.region)
+
+    try:
+        db_user = ssm.get_parameter(Name=ssm_user_key)['Parameter']['Value']
+    except ssm.exceptions.ParameterNotFound:
+        if options.summarise:
+            db_user = db_name + 'user' # won't be put in SSM, but we know what it would be
+        else:
+            db_user = db_name + 'user'
+            put_ssm(ssm_user_key, db_user, options.region, force=options.force_user)
+
+    try:
+        db_pass = ssm.get_parameter(Name=ssm_pass_key)['Parameter']['Value']
+    except ssm.exceptions.ParameterNotFound:
+        if options.summarise:
+            db_pass = 'Not found in Parameter Store, and not generated (script in summary mode)'
+        else:
+            db_pass = generate_db_pass()
+            put_ssm(ssm_pass_key, db_pass, options.region, force=options.force_user)
+
+    return db_user, db_pass
+
+def put_ssm(key, value, region, force=False):
+    """ put a key:value item into AWS Parameter Store
+    """
+    ssm = boto3.client('ssm', region_name=region)
+
+    log.info("Saving Parameter Store key = '%s', value = '%s'....", key, value)
+    response = ssm.put_parameter(
+        Name=key,
+        Value=value,
+        Overwrite=force,
+        Type='String'
+    )
+
+    return response
+
+
+
+def generate_db_pass(length=20):
+    """ gen a password with lower/upper letters + numbers
+    """
+    chars = string.ascii_letters + string.digits
+    password = ''.join(secrets.choice(chars) for i in range(length))
+
+    return password
+
+
+
+def run_mysql(sql, db_host, db_port, db_user, db_password):
+    """ run a supplied sql command against the given db
+        can't do multiple commands ('command 1; command 2'), must be single lines
+    """
+
+    cnx = mysql.connector.connect(
+        host=db_host,
+        port=db_port,
+        user=db_user,
+        passwd=db_password
+        )
+
+    cursor = cnx.cursor()
+
+    log.debug('Running the following sql against %s: %s', db_host, sql)
+
+    cursor.execute(sql)
+
+    cnx.close()
+
+    return cursor
+
+
+
+def create_mysql_db(db_params, root_user, root_pass):
+    """ ... creates... a mysql... db...
+    """
+
+    sql = 'create database if not exists %s;' % db_params['db_name']
+    run_mysql(sql, db_params['db_host'], db_params['db_port'], root_user, root_pass)
+
+
+
+def drop_mysql_user(db_params, root_user, root_pass):
+    """ ... drops... a mysql... user...
+    """
+
+    sql = "drop user if exists %s;" % db_params['db_user']
+    run_mysql(sql, db_params['db_host'], db_params['db_port'], root_user, root_pass)
+
+
+
+def get_mysql_version(db_host, db_port, db_user, db_password):
+    """ fetches mysql version, which can affect params needed for different operations
+    """
+
+    cnx = mysql.connector.connect(
+        host=db_host,
+        port=db_port,
+        user=db_user,
+        passwd=db_password
+        )
+
+    ver = cnx.get_server_version()
+    log.debug('mysql version = %s', ver)
+
+    cnx.close()
+
+    return ver
+
+
+
+def create_mysql_user(db_params, root_user, root_pass):
+    """ v5.x and v8 differ - we need to use 'native mysql' args for v8
+    """
+
+    mysql_version = get_mysql_version(db_params['db_host'], db_params['db_port'], root_user, root_pass)
+    if mysql_version[0] < 8:
+        log.debug('Mysql is less than v8, not using extra args for creating user')
+        extra_args = ''
+    else:
+        log.debug('Mysql is v8+, using extra args for creating user')
+        extra_args = 'with mysql_native_password'
+
+    sql = "create user if not exists '%s'@'%%' identified %s by '%s';" % (db_params['db_user'], extra_args, db_params['db_pass'])
+
+    run_mysql(sql, db_params['db_host'], db_params['db_port'], root_user, root_pass)
+
+
+
+def create_mysql_grants(db_params, root_user, root_pass):
+    """ apply universal grants for a mysql user on a specific db
+    """
+
+    ## 'multi' doesn't work this way, so just call it twice
+    #sql = "grant all privileges on %s.* to '%s'@'%%'; flush privileges;" % (db_params['db_name'], db_params['db_user'])
+    #run_mysql(sql, db_params['db_host'], db_params['db_port'], root_user, root_pass, multi=True)
+    sql = "grant all privileges on %s.* to '%s'@'%%';" % (db_params['db_name'], db_params['db_user'])
+    run_mysql(sql, db_params['db_host'], db_params['db_port'], root_user, root_pass)
+
+    sql = "flush privileges;"
+    run_mysql(sql, db_params['db_host'], db_params['db_port'], root_user, root_pass)
+
+
+def load_mysql_seedfile(db_params):
+    """ don't use the root user to load the seedfile - confirms that the db user can access the db
+    """
+
+    with open(db_params['db_seedfile'], 'r') as sf:
+        command = ['mysql',
+                   '-h', db_params['db_host'],
+                   '-P', str(db_params['db_port']),
+                   '-u', db_params['db_user'],
+                   db_params['db_name']
+                  ]
+        log.info("Running sql seedfile '%s' against database '%s'...", db_params['db_seedfile'], db_params['db_name'])
+        subprocess.check_call(command, stdin=sf, env=dict(os.environ, MYSQL_PWD=db_params['db_pass']))
+
+
+
+
+def init_mysql_db(options, db_params, root_user, root_pass):
+    """ set up the mysql database
+    """
+
+    log.info('Creating mysql db %s...', db_params['db_name'])
+    create_mysql_db(db_params, root_user, root_pass)
+
+    if options.force_user:
+        # if you need to pick up a new password because you didn't get it last time...
+        log.warning('Force user selected - dropping and recreating user %s (new password will be as above)', db_params['db_user'])
+        drop_mysql_user(db_params, root_user, root_pass)
+
+    log.info('Creating mysql user %s...', db_params['db_user'])
+    create_mysql_user(db_params, root_user, root_pass)
+    log.info('Granting privileges to %s on %s...', db_params['db_user'], db_params['db_name'])
+    create_mysql_grants(db_params, root_user, root_pass)
+
+    if db_params['db_seedfile']:
+        load_mysql_seedfile(db_params)
+
+
+def main():
+    """ ... main?
+    """
+
+    options = get_options()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+    log.debug(options)
+
+    if options.force_reset:
+        log.error("Force reset not implemented yet. Exiting.")
+        sys.exit(14)
+
+    if options.summarise:
+        log.info("SUMMARY MODE: will not edit MySQL user/db or Parameter Store entries")
+
+
+    aws_profile = os.getenv('AWS_PROFILE')
+    if aws_profile is None:
+        log.error('Env var AWS_PROFILE is not set. Please set it before rerunning the script (must be MFA-enabled to retrieve secrets from parameter store')
+        sys.exit(5)
+    log.info("Using profile '%s' as set in env var AWS_PROFILE", aws_profile)
+    log.info("(you must have an MFA-enabled CLI for the script to work)")
+
+    if not options.env:
+        envs = [ 'test', 'stag', 'prod', 'admin' ]
+        options.env = enquiries.choose('What is the env for the database: ', envs)
+    log.info("Using env '%s'", options.env)
+
+    # 'instance' is the nickname in RDS, used in parameter store
+    # 'host' is the FQDN for network connections
+    if not options.db_host or not options.db_instance:
+        log.info('Fetching list of RDS instances...')
+        db_instances, db_addresses = fetch_rds_instance_names(substring=options.substring, env=options.env)
+        options.db_instance = enquiries.choose('Which DB host will the new db be created on: ', db_instances)
+        options.db_host = db_addresses[options.db_instance]
+
+    log.info("Using mysql host '%s'", options.db_host)
+
+
+    root_user = 'root'
+    log.info("Fetching root password from Parameter Store...")
+    root_pass = fetch_mysql_root_pass_from_ssm(options, options.env, options.db_instance)
+    log.debug(root_pass)
+
+    if options.gimme_pass:
+        log.warning("GIMME ROOT PASS MODE ACTIVATED")
+        log.info("Password for user 'root' on '%s:%s' is:", options.db_host, options.db_port)
+        log.info(root_pass)
+        log.info("Cheerio.")
+        sys.exit()
+
+
+
+
+    while options.namespace == '':
+        options.namespace = enquiries.freetext('What is the namespace for the database: ')
+        if options.namespace == '':
+            log.warning('Namespace cannot be empty')
+    log.info("Using namespace '%s'", options.namespace)
+
+    if not options.seedfile:
+        if enquiries.confirm('Do you want to provide a seed sql file?'):
+            options.seedfile = enquiries.freetext('Path to the seed file: ')
+
+    if options.seedfile:
+        log.info("Using seed file '%s'", options.seedfile)
+    else:
+        log.info("No seedfile selected, database will be empty")
+
+
+
+    db_params = {}
+    db_params['db_host'] = options.db_host
+    db_params['db_port'] = options.db_port
+    db_params['db_name'] = '_'.join([options.namespace, options.env])
+    #db_params['db_user'] = '_'.join([options.namespace, options.env + 'user'])
+    db_params['db_user'], db_params['db_pass'] = get_db_creds(options, options.env, options.db_instance, db_params['db_name'])
+    db_params['db_seedfile'] = options.seedfile
+
+    log.info('SUMMARY:')
+    log.info('- Host: %s', db_params['db_host'])
+    log.info('- Port: %s', db_params['db_port'])
+    log.info('- Database: %s', db_params['db_name'])
+    log.info('- Username: %s', db_params['db_user'])
+    log.info('- Password: %s', db_params['db_pass'])
+    log.info('- Seedfile: %s', db_params['db_seedfile'])
+
+    if not options.summarise:
+        # Parameter Store will already have the user/pass written to it at this point... but meh.
+        if not enquiries.confirm('Create a db with the above parameters?'):
+            log.info('Aborting at user request')
+            sys.exit(4)
+
+        init_mysql_db(options, db_params, root_user, root_pass)
+
+
+    log.info("Done.")
+
+if __name__ == '__main__':
+    main()
