@@ -1,0 +1,75 @@
+#!/bin/bash
+set -o pipefail
+#set -x
+
+if [ -z "$1" ]; then
+cat << EOF
+Usage: $0 list-of-hostnames.txt [IP_ADDRESS]
+
+The file is any old file with the list of hostnames to check for
+responses, one host per line. Generally you want this to be base
+domains for redirects, but can be anything you want to find the
+redirect for
+
+The ip address is for host-hacking, so you can test redirects before
+you switch them in real DNS (of course, LE https certs won't be
+available until DNS is switched)
+
+This script was created to help confirm that all redirectors were
+correctly set on our own redirection service when marketing had a
+habit of giving us scores of near-identical domain names
+
+EOF
+exit
+fi
+
+filename="$1"
+fakeip="$2"  # optionally send requests to a different IP address
+
+redirector_ip="1.2.3.4"
+my_company="MYCOMPANY"
+
+checkit(){
+
+    res=$(curl -s -I -m 3 $1)
+
+    code=$(grep HTTP <<<$res | awk '{print $2}' || echo 'ERROR')
+    target=$(grep -i Location <<<$res | awk '{print $2}' || echo 'ERROR')
+
+    echo "$code $target"
+}
+
+domainlist=""
+while IFS= read -r line; do
+
+
+    ip="$(dig +short $line)"
+    #echo $ip
+    if ! grep -q $redirector_ip <<< "$ip"; then
+        echo "== $line is not on $my_company redirector, skipping... =="
+        echo "(ip = $ip)"
+        echo
+        continue
+    fi
+
+    echo "== Redirects for $line =="
+
+    curl_resolve=""
+    if [ -n "$fakeip" ]; then
+        curl_resolve="--resolve $line:80:$fakeip --resolve $line:443:$fakeip"
+    fi
+
+    echo -n "http: "
+    checkit "$curl_resolve http://$line"
+
+    echo -n "https: "
+    checkit "$curl_resolve https://$line"
+
+    echo
+
+    domainlist="$domainlist$line\n"
+
+done < "$filename"
+
+echo "Domains to be transferred:"
+echo -e $domainlist

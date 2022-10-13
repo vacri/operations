@@ -10,6 +10,7 @@ As most of these scripts are sanitised, there are some variables at the start th
 | archive-gmail     | get a zipped .mbox of your gmail |
 | bash.boilerplate  | boilerplate for bash scripts |
 | check-elasticsearch | nagios check for ElasticSearch status |
+| check-redirects   | confirm http redirects for a list of domains |
 | ddvpn-syd         | call with sudo with OpenConnect installed, connects to your Dimension Data Sydney VPN |
 | deploy-s3-site    | uploads repos/local dirs to s3 bucket websites, gzipping appropriate files |
 | ec2-create-rolling-snapshot | snapshots EC2 volumes, intended as a daily cronjob |
