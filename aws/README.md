@@ -16,3 +16,5 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | ec2-instance-volume-snapshot | snapshot (backup) all EC2 volumes with given tag+value |
 | ec2-remake-lc | automate updating an ASG LC - manually updating is prone to error |
 | https_expiry_checker.py | AWS Lambda code for cert expiry checking |
+| r53-ns-compare          | Discover if an R53 zone is live DNS or not |
+| r53-set-record          | Make single r53 records |

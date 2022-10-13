@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+## add this line if we start using common in-house libs
+#sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
+import boto3
+
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+
+def get_options():
+    """ ... gets... options?
+    """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              r53-set-record NEWDOMAIN RECORDTYPE "TARGET;TARGET"
+              r53-set-record newname.example.com cname target.example.net
+
+            A quick and dirty script for use in a loop to batch-create domains,
+            with a standard 300s TTL. script tries to detect the zone from the
+            supplied new domain name
+
+            export AWS_PROFILE=nbl
+            for name in adelaide36ers brisbanebullets taipans hawks melbourneutd nzbreakers wildcats semphoenix sydneykings; do
+                 ./r53-set-record testing-${name}.nbldev.net cname testing-spaceship.nbldev.net;
+            done
+
+
+            you'll need your AWS_PROFILE env var set appropriately
+
+            script is lazy, and only handles .com, .net, and .com.au domains,
+            and only zones which are a single subdomain of one of these TLDs
+
+            script does not do magic AWS aliases
+
+            multiple targets can be specified if semicolon-delimited, but only
+            for A records - CNAMEs don't support multiple values
+        '''))
+
+    parser.add_argument('domain', help='record to make', default='help')
+    parser.add_argument('recordtype', help='A or CNAME records only', default='help')
+    parser.add_argument('targets', help='what to point the record at, semicolon-delimited list', default='help')
+    parser.add_argument('--delete', help='delete record instead of create/update (not supported after all)', action='store_true')
+    parser.add_argument('--loglevel', help='', default='INFO')
+    parser.add_argument('--debug', help='overrides other loglevels', action='store_true')
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+    finally:
+        if options.debug:
+            print("logging set to debug")
+            options.loglevel = logging.DEBUG
+
+    options.recordtype = options.recordtype.upper()
+    if options.recordtype not in ['A', 'CNAME']:
+        log.error('Type %s not supported, aborting', options.recordtype)
+        sys.exit(53)
+
+    if options.delete:
+        options.action = 'delete'
+    else:
+        options.action = 'upsert'
+
+    options.zonename = None
+    for tld in ['.com', '.com.au', '.net', '.tv']:
+        if options.domain.endswith(tld):
+            # break off the tld so that we can grab the final domain part
+            domain_no_tld = options.domain[:-len(tld)]
+            options.zonename = domain_no_tld.split('.')[-1] + tld
+            break
+    if not options.zonename:
+        log.error('Could not detect domain base from %s, aborting', options.domain)
+
+    #print(vars(options))
+
+    return options
+
+
+def find_zone_id(zonename):
+    r53c = boto3.client('route53')
+
+    hosted_zone_list = r53c.list_hosted_zones()
+    zones = [x for x in hosted_zone_list['HostedZones'] if x['Name'].rstrip('.') == zonename]
+
+    if len(zones) > 1:
+        raise ValueError('More than one zone match for ' + zonename)
+
+    if len(zones) == 0:
+        raise ValueError('No zone matches found for ' + zonename)
+
+    zoneid = zones[0]['Id'].replace('/hostedzone/', '')
+
+    return zoneid
+
+
+def set_zone_record(zoneid, domain, recordtype, targets):
+
+    changebatch_skel = {
+                    'Comment': 'Upserting',
+                    'Changes': [
+                        {
+                            'Action': 'UPSERT',
+                            'ResourceRecordSet': {
+                                'Name': domain,
+                                'Type': recordtype,
+                                'TTL': 300,
+                                'ResourceRecords': []
+                            }
+                        }
+                    ]
+                }
+
+    for target in targets.split(';'):
+        changebatch_skel['Changes'][0]['ResourceRecordSet']['ResourceRecords'].append({'Value': target})
+
+    log.debug(changebatch_skel)
+
+    r53c = boto3.client('route53')
+
+    log.info('Setting %s to %s %s in zone %s...', domain, recordtype, targets, zoneid)
+    res = r53c.change_resource_record_sets(
+            HostedZoneId=zoneid,
+            ChangeBatch=changebatch_skel)
+
+    #print(res)
+
+def delete_zone_record(zoneid, domain):
+    log.warning('Deletion not supported after all - batch deletion of records is trivial in web console')
+    pass
+
+def main():
+    """ ... main?
+    """
+
+    options = get_options()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+    log.info("let's go!")
+    log.debug(options)
+
+    zoneid = find_zone_id(options.zonename)
+
+
+
+
+
+
+    if options.action == 'upsert':
+        set_zone_record(zoneid, options.domain, options.recordtype, options.targets)
+    if options.action == 'delete':
+        delete_zone_record(zoneid, options.domain)
+
+    log.info('Done.')
+
+
+
+
+if __name__ == '__main__':
+    main()

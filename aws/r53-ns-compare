@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+
+""" We had scores of dead Route53 zones, and you find out if they're active or
+dead by comparing the domain's nameservers against the R53 zone's nameservers
+"""
+
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import dns.resolver
+import boto3
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+
+def get_options():
+    """ ... gets... options?
+    """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              r53-ns-compare [-d] [-r DNS_RESOLVER]
+              AWS_PROFILE=abc r53-ns-compare -r 8.8.8.8
+
+            Compares the nameservers in found AWS zones for the indicated
+            account, and checks them against results from your default DNS
+            resolver. You can also specify your own DNS resolver (eg 8.8.8.8)
+
+            If the nameservers match, then the DNS zone is PROBABLY managed in
+            that AWS account - but not canonically defined as so, because someone
+            may have cloned that zone to a different account and kept the settings.
+
+            Quick and dirty script that works off your env's AWS_PROFILE var
+
+            Note: python module in debian is python3-dnspython, not python3-dns
+        '''))
+
+    parser.add_argument('-r', '--resolver', help='use a specific DNS resolver/IP', default=None)
+    parser.add_argument('-q', '--quiet', help='sets loglevel=ERROR, good for cron', action='store_true')
+    parser.add_argument('--loglevel', help='', default='INFO')
+    parser.add_argument('--debug', help='overrides other loglevels', action='store_true')
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+    finally:
+        if options.quiet:
+            options.loglevel = logging.ERROR
+        if options.debug:
+            print("logging set to debug")
+            options.loglevel = logging.DEBUG
+
+    #print(vars(options))
+
+    return options
+
+def get_zoneid_list():
+    """ get a list of the zoneids owned by the AWS account
+    """
+
+    client = boto3.client('route53')
+
+    response = client.list_hosted_zones()
+
+    zoneid_list = []
+    for zone in response['HostedZones']:
+        zoneid = {'Name': zone['Name'], 'Id': zone['Id'].split('/')[-1]}
+        zoneid_list.append(zoneid)
+
+
+
+
+    #result = [x['Id'].split('/')[-1] for x in response['HostedZones']]
+
+    return zoneid_list
+
+def get_zone_ns_r53(zoneid):
+    """ fetch nameservers from Route53 for the nominated zone
+    """
+
+    client = boto3.client('route53')
+
+    try:
+        res = client.get_hosted_zone(Id=zoneid)
+    except KeyError as e:
+        log.error('Route53 lookup for %s failed: %s', zoneid, e)
+        res = "Route53 NS lookup error"
+    log.debug("Route53 lookup data: %s", res)
+
+    try:
+        private = res['HostedZone']['Config']['PrivateZone']
+    except:
+        private = False
+
+    if not private:
+        # private zones don't have this config item
+        r53ns = [x.rstrip('.') for x in res['DelegationSet']['NameServers']]
+    else:
+        r53ns = []
+
+    return set(r53ns), private
+
+def get_zone_ns_external(zonename, resolver=None):
+    """ fetch nameservers from regular DNS for the nominated zone
+    """
+
+    my_resolver = dns.resolver.Resolver()
+    my_resolver.timeout = 3
+    my_resolver.lifetime = 3
+
+    if resolver is not None:
+        my_resolver.nameservers = [resolver]
+
+
+    #res = dns.resolver.query(zonename, 'NS')
+    #res = my_resolver.query(zonename, 'NS')
+    res = my_resolver.resolve(zonename, 'NS')
+
+    # convert from answer obj to list - [x for x in y] doesn't do this?
+    ns_list = []
+    for nameserver in res:
+        ns_list.append(str(nameserver).rstrip('.'))
+
+    return ns_list
+
+def compare_zone_dns(zone, resolver=None):
+    """ compare the nameservers returned and complain if they don't
+        match between R53 and regular DNS
+    """
+
+    # sets allow matching without needing ordering
+    r53_ns_set, r53_private = get_zone_ns_r53(zone['Id'])
+    if r53_private == True:
+        log.info("Zone '%s' (%s) is a private zone in Route53, skipping", zone['Name'].rstrip('.'), zone['Id'])
+        return
+
+    try:
+        ext_ns_set = set(get_zone_ns_external(zone['Name'], resolver))
+    except Exception as e:
+        log.error('DNS lookup error for %s (%s): %s', zone['Name'].rstrip('.'), zone['Id'], e)
+        ext_ns_set = "NS lookup error"
+
+    log.debug('r53_ns_set: %s', r53_ns_set)
+    log.debug('ext_ns_set: %s', ext_ns_set)
+
+    if r53_ns_set == ext_ns_set:
+        log.info('Nameservers match for zone %s (%s)', zone['Name'].rstrip('.'), zone['Id'])
+    else:
+        log.warning('Mismatch between AWS and public DNS for zone %s (%s):', zone['Name'].rstrip('.'), zone['Id'])
+        log.warning('  route53: %s', r53_ns_set)
+        log.warning('  public dns: %s', ext_ns_set)
+
+
+def main():
+    """ ... main?
+    """
+
+    options = get_options()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+    log.debug(options)
+
+    if options.resolver is not None:
+        log.info("Using DNS resolver '%s'", options.resolver)
+
+    if 'AWS_PROFILE' in os.environ:
+        log.info("Checking aws profile '%s'", os.environ['AWS_PROFILE'])
+        options.profile = os.environ['AWS_PROFILE']
+    else:
+        log.warning("No env var AWS_PROFILE found - will use default env in your ~/.aws/config")
+        options.profile = '(default)'
+
+    hosted_zones = get_zoneid_list()
+    log.debug('Hosted zones: %s', hosted_zones)
+
+    for zone in hosted_zones:
+        compare_zone_dns(zone, options.resolver)
+
+    log.info("NOTE: Matching NS records do not definitively mean that this AWS account manages the DNS zone")
+    log.info("(it's just very likely - however it is possible to create a zone in another AWS account, and set the NS records to match)")
+    log.info('Done.')
+
+
+if __name__ == '__main__':
+    main()
