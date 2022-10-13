@@ -25,4 +25,4 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | s3-bucket-backup        | backups up s3 buckets to a subdir of another bucket. Good for web asset buckets, even with s3 file versioning |
 | s3-static-sote-update-redirects | s3 static websites have a page redirection engine. this script is used to update the rules list |
 | ses-smtp-conv.sh        | convert your IAM user/secret into SES user/secret for SMTP usage |
-
+| sshe                    | ssh into an ECS host running a service with the nominated string |

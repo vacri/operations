@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# ^^ silly hashbang because macos
+
+# this script breaks occasionally when the format of the text outputs of awscli
+# changes
+
+set -e
+set -o pipefail
+profile=''
+region='ap-southeast-2'
+user='ec2-user'
+
+PROGNAME=$(basename $0)
+usage() {
+cat <<EOF
+Usage:
+    $PROGNAME [-r AWS_REGION] [-u SSH_USER] aws_profile env application
+    $PROGNAME MYCOMPANY staging spaceship  # for my AWS profile 'MYCOMPANY'
+
+$PROGNAME hunts down an instance running your task on ECS that is related to
+the env and application you specify, and then connects you via ssh (you will
+need the correct key in your ssh agent)
+
+The 'application' can be any string that is in the service name - for example,
+for 'app-mutd-booking-api-test-ECSService-1A67201VQQG67' you could use 'mutd'
+or 'booking' or even 'book' or 'mutd-bo', since these terms are only used
+for that one service
+
+(detection will only work if the cluster name includes the env string, and
+the service name needs to contain both env and application strings)
+
+Requirements:
+- awscli
+- jq
+
+EOF
+exit 0
+}
+
+
+while getopts "p:r:u:" option; do
+    case $option in
+        r) region="$OPTARG";;
+        u) user="$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+if [ -z "$1" ]; then usage; fi
+
+profile=$1
+
+case $2 in
+    production|prod|pr|p) env=prod; cluster_env=production;;
+    staging|stag|st|s) env=stag; cluster_env=staging;;
+    testing|test|te|t) env=test; cluster_env=staging;;
+    *) echo "Unsupported env '$1', exiting"; exit 22;;
+esac
+
+case $3 in
+    spaceship|space|ss|s) app=spaceship;;
+    *) app="$3";;
+esac
+
+
+echo "Okay, let's look for a host running '$env/$app' (using profile '$profile')..."
+
+
+# couldn't figure out how to do a query on "list item contains foo", so hello jq!
+# (googlejuice had plenty for dict items, but not list items)
+cluster=$(aws ecs list-clusters \
+            --profile $profile \
+            --region $region \
+            --query "clusterArns" \
+            | jq -r ".[] | select(test(\"$cluster_env\"))" \
+            | cut -d/ -f2
+        )
+
+echo "Cluster: $cluster"
+
+service=$(aws ecs list-services \
+            --profile $profile \
+            --region $region \
+            --cluster $cluster \
+            --query "serviceArns" \
+            | jq -r ".[] \
+                        | select(test(\"$app\")) \
+                        | select(test(\"$env\"))" \
+            | cut -d/ -f3
+        )
+if [ -z "$service" ]; then
+    echo "No service found for '$env/$app' (using $profile creds). Exiting."
+    exit 11
+elif [ "$(wc -l <<<$service)" > 1 ]; then
+    echo -e "Found more than one service - using the first one from this list:\n---\n$service\n(specify a more unique string to filter appropriately)\n---"
+    service=$(head -n 1 <<<$service)
+    echo "Service: $service"
+else
+    echo "Service: $service"
+fi
+
+# tasks will return a bunch, but we only need one
+task=$(aws ecs list-tasks \
+            --profile $profile \
+            --region $region \
+            --cluster $cluster \
+            --service-name $service \
+            --query "taskArns[0]" \
+            --output text \
+            | cut -d/ -f3
+        )
+#echo $task
+
+container_instance=$(aws ecs describe-tasks \
+            --profile $profile \
+            --region $region \
+            --cluster $cluster \
+            --tasks $task \
+            --query "tasks[*].containerInstanceArn" \
+            --output text \
+        )
+        #    | cut -d/ -f2
+        #)
+            #| jq -r ".tasks[].containerInstanceArn" \
+
+#echo $container_instance
+
+instance_id=$(aws ecs describe-container-instances \
+            --profile $profile \
+            --region $region \
+            --cluster $cluster \
+            --container-instances $container_instance \
+            --query "containerInstances[0].ec2InstanceId" \
+            --output text
+        )
+
+#echo $instance_id
+
+ip=$(aws ec2 describe-instances \
+            --profile $profile \
+            --region $region \
+            --instance-id $instance_id \
+            --query 'Reservations[*].Instances[*].PrivateIpAddress' \
+            --output text \
+        )
+
+#echo $ip
+
+if [ -z "$ip" ]; then
+    echo "No matching instances found. Exiting."
+    exit 5
+else
+    echo "Found a container on host $ip ($instance_id) - connecting as '$user'..."
+fi
+
+# loglevel ERROR suppresses the "omg no hostkey checking!" message
+ssh -o UserKnownHostsFile=/dev/null -o "LogLevel ERROR" -o StrictHostKeyChecking=no $user@$ip
