@@ -1,0 +1,10 @@
+#!/bin/bash
+
+a=" have you checked the logs?"
+b="what do the logs say?"
+c="have you looked at the logs yet?"
+d="the answer might be in the logs?"
+e="I wonder if the logs have anything to say on that?"
+f="and the logs are clean?"
+
+echo -e "$a\n" "$b\n" "$c\n" "$d\n" "$e\n" "$f" | shuf -n 1

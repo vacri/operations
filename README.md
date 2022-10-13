@@ -14,6 +14,7 @@ As most of these scripts are sanitised, there are some variables at the start th
 | deploy-s3-site    | uploads repos/local dirs to s3 bucket websites, gzipping appropriate files |
 | ec2-create-rolling-snapshot | snapshots EC2 volumes, intended as a daily cronjob |
 | kvm-backup        | backup KVM virtual machines that aren't snapshottable (requires VM downtime) |
+| gatekeeper        | tar/zipfile deployer for autoscaled VMs, see README in subdir |
 | git-counter       | compare contributors' lines of code for a repo |
 | info.php | php info snippet for testing webserving works |
 | init.boilerplate.centos | init script template for ye olde CentOS, which I never want to touch again |
@@ -26,4 +27,5 @@ As most of these scripts are sanitised, there are some variables at the start th
 | send-sms-global   | sends SMSes via SMS Global |
 | snappywrapper     | use the ec2 rolling snapshotter  within AWS, using instance role-based perms |
 | unifi-prune.js    | en-smallerise the mongo DB used by the unifi controller |
+| vacri-in-a-box    | ops advice simulator for devs |
 | yank              | script to overcome Docker's shortcomings for deployment |
