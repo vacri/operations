@@ -24,3 +24,5 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | route53_backup.py       | AWS Lambda code to backup route53 zones to s3 |
 | s3-bucket-backup        | backups up s3 buckets to a subdir of another bucket. Good for web asset buckets, even with s3 file versioning |
 | s3-static-sote-update-redirects | s3 static websites have a page redirection engine. this script is used to update the rules list |
+| ses-smtp-conv.sh        | convert your IAM user/secret into SES user/secret for SMTP usage |
+
