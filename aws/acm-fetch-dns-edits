@@ -1,0 +1,54 @@
+#!/bin/bash
+# Needs awscli + a profile set
+
+# Usage: acm-fetch-dns-edits www.example.com
+
+# This script was a failed effort to make a text-mode listing of the
+# DNS edits a client would need to make to allow us to create an SSL
+# certificate on their behalf. This was required if we didn't
+# control their DNS. I say failed because it turns out that polling
+# the ACM API wasn't giving consistent text results
+
+# In practice, very few of our clients understood DNS at all, so
+# providing this in BIND format confused matters. The DNS edits for
+# ACM are long hashes, so the client-favourite of doing screenshots
+# also doesn't work.
+
+# I had been copying the data manually into an email program, but
+# had an issue with one client where my mail program silently copied
+# the hash twice while only showing it to me once - the double
+# string was seen on the client's reply. Copying text out of the ACM
+# console is weird and unusual (there is a button to 'copy to
+# clipboard' but it's... manky... and sometimes doesn't work right
+
+set -e
+
+filterstring=MYCOMPANY
+domain=$1
+default_profile=CHANGEME
+profile=""
+
+if [ -z "$AWS_PROFILE" ]; then
+    echo "No AWS_PROFILE env var found. Using '$default_profile' instead"
+    profile="--profile $default_profile"
+fi
+
+
+if grep -q "$filterstring" <<< "$1"; then
+    echo "This script doesn't work if '$filterstring' is in the domain name. Aborting"
+    exit 11
+fi
+
+cert_arn=$(aws $profile --region us-east-1 acm list-certificates --query "CertificateSummaryList[?DomainName=='$domain'].CertificateArn" --output text)
+
+# TODO check if more than one line in output
+
+if [ -z "$cert_arn" ]; then
+    echo "No cert found for $domain, aborting"
+    exit 10
+fi
+
+echo "record | type | value"
+echo "---------------------"
+aws $profile --region us-east-1 acm describe-certificate --certificate-arn "$cert_arn" --output text --query 'Certificate.DomainValidationOptions[].ResourceRecord' | grep -v "$filterstring" | sort | uniq
+
