@@ -1,0 +1,592 @@
+#!/usr/bin/env python
+""" Index and upload packages to s3, for retrieval by a companion script """
+
+# Originally a boto script, just the s3 items were updated to boto3 due to time pressure
+
+#TODO: create package index if upload doesn't find it
+#TODO: replace all boto with boto3
+#TODO: skip upload and just update the index, for packages that are already uploaded
+#TODO: the above is done, but doesn't confirm that the package is already uploaded
+
+from __future__ import print_function
+
+import sys
+import os
+import argparse
+import textwrap
+import time
+from time import sleep
+import logging
+import pwd
+import grp
+import subprocess
+import requests
+import boto
+import boto.s3.connection
+#from boto.s3.key import Key
+import yaml
+from  more_itertools import unique_everseen
+import boto3
+import botocore
+from botocore.exceptions import ClientError
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+# real iso8601, not the 'iso8601 with several changes to it' of the logging module
+if time.tzname[0] == 'UTC':
+    formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                  '%Y-%m-%dT%H:%M:%SZ')
+else:
+    if sys.version_info[0] == 2:
+        # python 2's TZ here is stuffed (always reports +00:00) so drop it
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                      '%Y-%m-%dT%H:%M:%S')
+    else:
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                      '%Y-%m-%dT%H:%M:%S%z')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+def get_options():
+    """ gets... options... ? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''\
+
+            Usage:
+              s3-package-indexer [OPTIONS] AWS_ACCT ENV APPNAME FULL_PACKAGE_NAME|list
+
+              s3-package-indexer nbl production nbl-mothership my_new_tarball.tar.gz
+              s3-package-indexer nbl staging nbl-mothership list
+
+            s3-package-indexer is a package manager that uses s3 as a package repository.
+            The package format is irrelevant - it is simply stored on S3, and an index is
+            created to point relevant environments to which package to retrieve. It is
+            assumed that the companion script will know how to handle the package - at time
+            of writing, the companion script can only handle tarballs and .deb files.
+
+            If you provide 'list' as the package name, the script will instead show you the
+            current listing, retrieved from s3.
+
+            A companion script reads the posted index, then retrieves the correct package
+            for the deployed environment.
+
+            Note that although you can override the s3 bucket/key setup, your user will
+            require perms to the resulting location. The buildserver agents probably won't
+            have those perms. Note also that when a tarfile that already exists on s3 will
+            be silently skipped over, rather than be re-uploaded.
+
+            WARNING: if you're doing 'register-only', note that all indexed packages must
+            exist at the target location, or the companion script will fail as it tries to
+            download each listed package
+
+            WARNING: This script DOES NOT SUPPORT AWS PROFILES if you're running in
+            meatspace. To use a non-default profile, invoke with "AWS_PROFILE=foo" as
+            an env var
+
+        '''))
+
+    parser.add_argument('account', help='lkg/nbl', default='help')
+    parser.add_argument('environment', help='production/staging/testing', default='help')
+    parser.add_argument('app', help='application name to deploy', default='help')
+    parser.add_argument('package', help="the full package filename", default="help")
+    parser.add_argument('--region', help='AWS region, defaults to ap-southeast-2', default='ap-southeast-2')
+    parser.add_argument('-b', '--s3-upload-bucket', help='s3 bucket, part of upload location, defaults to $ACCOUNT-packages')
+    parser.add_argument('-k', '--s3-upload-key-prefix', help='s3 key prefix')
+    parser.add_argument('-d', '--delete',
+                        help='(TODO: broken) delete nominated package instead of uploading', action='store_true')
+    parser.add_argument('--delete-deploy-target',
+                        help='delete an errant deploy_target, takes the value of packagename for the target',
+                        action='store_true')
+    parser.add_argument('-i', '--init',
+                        help='initialise a skeleton configuration, for setting up a new package/env ',
+                        action='store_true')
+    parser.add_argument('-r', '--register-only', help='register file on index but do not upload package', action='store_true')
+    parser.add_argument('-u', '--upload-only', help='upload package to s3, but do not index', action='store_true')
+    #parser.add_argument('--dryrun', help='Use dryrun switch with boto',
+    #                    default=False, action='store_true')
+    parser.add_argument('-t', '--target',
+                        help='deploy target for the environment (current/rollback/etc). Can create new targets on demand',
+                        default='current')
+    parser.add_argument('--fetch',
+                        help='download the nominated package to the current dir',
+                        action='store_true')
+
+    options = parser.parse_args()
+
+    options.spare_packages = 0  # how many 'spare' packages to keep installed
+                                # does not include 'current' and 'rollback' packages
+    options.package_path, options.package = os.path.split(options.package)
+
+    #print vars(options)
+    if not options.environment:
+        log.error("No environment specified (-e production|staging|testing). Aborting.")
+        sys.exit(2)
+
+    if not options.app:
+        log.error("No app specified (-a). Aborting.")
+        sys.exit(3)
+
+    if not options.s3_upload_bucket:
+        options.s3_upload_bucket = options.account + '-packages'
+
+    return options
+
+#
+# helper functions
+# these helpers should be filched out to their own lib at some point
+#
+
+def ec2_get_own_tagvalue(tag, wait_for_tag=False):
+    """ instance needs IAM perms to retrieve own ec2 tags
+    """
+    instance_id_url = 'http://169.254.169.254/latest/meta-data/instance-id'
+    az_url = 'http://169.254.169.254/latest/meta-data/placement/availability-zone'
+
+    instance_id = requests.get(instance_id_url).text
+    region = requests.get(az_url).text[:-1]
+
+    conn = boto.ec2.connect_to_region(region)
+
+    max_attempts = 1
+    if wait_for_tag:
+        max_attempts = wait_for_tag
+
+    attempts = 0
+    while attempts < max_attempts:
+        attempts += 1
+        #print(attempts)
+        try:
+            tags = conn.get_all_tags(filters={'resource-id': instance_id, 'key': tag})
+            if tags[0].value:
+                break
+        except:
+            if attempts < max_attempts:
+                sleep(1)
+            else:
+                if wait_for_tag:
+                    log.error("Couldn't retrieve tag '%s' after %d seconds...", \
+                              tag, max_attempts)
+                raise
+
+    return tags[0].value
+
+def s3_get_file(s3_bucket, s3_key, dest_dir):
+    """ fetch file from s3 and deposit to dest dir
+    """
+
+    filename = os.path.basename(s3_key)
+    filepath = '/'.join([dest_dir, filename])
+
+    s3 = boto3.client('s3')
+    s3.download_file(s3_bucket, s3_key, filepath)
+
+    return filepath
+
+def s3_get_yaml(s3_bucket, s3_key):
+    """ read yaml config residing on s3. needs s3 perms, obviously
+    """
+
+    log.info("Reading yaml config from s3://%s/%s...", s3_bucket, s3_key)
+
+    s3 = boto3.resource('s3')
+    obj = s3.Object(s3_bucket, s3_key)
+
+    s3_string_output = obj.get()['Body'].read()
+
+    config = yaml.load(s3_string_output)
+
+    return config
+
+def chown(path, user, group, recursive=False):
+    """ mostly to make recursive chowning easier
+    """
+
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    if recursive:
+        # FIXME: this breaks on broken symlinks with 'file not found'.
+        # test perhaps with an lstat/ifexists
+        # EDIT: untested - lchown might work around this problem (doesn't follow symlinks)
+        for root, dirs, files in os.walk(path):
+            os.chown(root, uid, gid)
+            for item in dirs:
+                os.lchown(os.path.join(root, item), uid, gid)
+            for item in files:
+                os.lchown(os.path.join(root, item), uid, gid)
+    else:
+        os.chown(path, uid, gid)
+
+def exit_unless_root():
+    """ got root rights? """
+    if not os.geteuid() == 0:
+        log.error('Must run as root. Aborting.')
+        sys.exit(1)
+
+def get_version_from_packagename(package):
+    """ assumes starts with app name + underscore, finishes with canned suffix
+        - ecal-app_1.2.3-b55~afsa.tar.gz / .tgz
+        - nexus_1.2.3-b55~asdfa_amd64.deb
+    """
+
+    # cut off first bit
+    version = package.partition('_')[2]
+
+    # use the suffixes as (excluded) partition values
+    exclude_suffixes = ['.tar.gz', '.tgz', '_amd64.deb', '_all.deb']
+    for suffix in exclude_suffixes:
+        version = version.partition(suffix)[0]
+
+    if version is None:
+        log.error("Package name must be a tar.gz or a .deb, \
+                  and must be prefixed with the app name and an underscore")
+        log.error("(eg: cool-app_v1.2.3+abcd.tar.gz)")
+        raise ValueError("Could not extract version from '%s'!" % package)
+
+    return version
+
+
+def untar_to_dir(tarfile, location):
+    """ native tarfile module is confusing, ran out of time
+    """
+    #TODO: switch to python-native tarfile module
+
+    cmd = 'tar xf ' + tarfile + ' -C ' + location
+    #print cmd
+    try:
+        subprocess.call(cmd.split())
+    except:
+        raise
+
+
+
+def getconf_s3(options):
+    """ fetch config from s3 """
+
+    # remove traling '-environ'
+    pkg_index_file = options.application + '.yml'
+    #pkg_index_file = options.application + '-' + options.env + '.yml'
+    pkg_index_s3loc = (options.s3_bucket, '/'.join([options.s3_prefix,
+                                                    pkg_index_file]))
+
+
+    config = s3_get_yaml(pkg_index_s3loc[0], pkg_index_s3loc[1])
+
+    return config
+
+
+def s3_key_exists(s3_bucket, s3_key):
+    """ checks a file exists on s3. Not very efficent - makes a new s3 connection for each pass
+    """
+
+    s3 = boto3.resource('s3')
+    try:
+        s3.Object(s3_bucket, s3_key).load()
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == "404":
+            return False
+        else:
+            raise
+    else:
+        return True
+
+
+def s3_put_yaml(s3_bucket, s3_key, config, newkey=False):
+
+    """
+    put yaml config file onto s3. 'newkey' is required if it doesn't already exist
+    """
+    log.debug('new index config:')
+    log.debug(yaml.dump(config, default_flow_style=False))
+
+    s3 = boto3.resource('s3')
+    s3.Object(s3_bucket, s3_key).put(Body=yaml.dump(config, default_flow_style=False))
+
+    return
+
+
+def s3_upload_file(s3_bucket, s3_key, filepath):
+    """ uploads a file to s3 """
+    log.debug('Uploading %s to s3://%s/%s...', filepath, s3_bucket, s3_key)
+
+    s3 = boto3.resource('s3')
+    with open(filepath, 'rb') as data:
+        s3.Bucket(s3_bucket).put_object(Key=s3_key, Body=data)
+
+    return
+
+#
+# funcs
+#
+
+
+
+def init_skeleton_config(s3_yaml_bucket, s3_yaml_key, options):
+    """ create a starter config on s3 """
+
+    # check it doesn't already exist
+    #s3conn = boto.connect_s3(calling_format=boto.s3.connection.OrdinaryCallingFormat())
+    #bucket = s3conn.get_bucket(s3_yaml_bucket)
+    #key = bucket.get_key(s3_yaml_key)
+
+    #if key is not None:
+    if s3_key_exists(s3_yaml_bucket, s3_yaml_key):
+        log.error("Package index file s3://%s/%s already exists, will not overwrite. Aborting.", \
+            s3_yaml_bucket, s3_yaml_key)
+        sys.exit(5)
+
+    config = {options.app:
+                  {options.environment:
+                       {
+                           'deploy_targets': {'current': options.package,
+                                              'rollback': options.package
+                                             },
+                           'package_bucket': options.s3_upload_bucket,
+                           'package_dir': '/'.join([options.s3_upload_key_prefix, options.app]),
+                           'packages': [options.package]
+                       }
+                  }
+             }
+
+    return config
+
+
+
+def update_index(config, options):
+    """ rearrange index with new information """
+
+    config_targets = config[options.app][options.environment]['deploy_targets']
+    if options.target == 'current':
+
+        log.info("Updating current package to %s and setting rollback to %s...", \
+                 options.package, config_targets['current'])
+
+        if os.path.basename(options.package) == config_targets[options.target]:
+            log.info('... skipping rollback update as current live package matches requested package %s...', \
+                     options.package)
+        else:
+            config_targets['rollback'] = config_targets['current']
+            config_targets['current'] = os.path.basename(options.package)
+    else:
+        log.info("Updating %s target with package %s...", options.target, options.package)
+        config_targets[options.target] = os.path.basename(options.package)
+
+    log.info("Adding new package to list...")
+    config[options.app][options.environment]['packages'].append(os.path.basename(options.package))
+
+    # updating package_dir, in case it's changed (rare, but possible when switching repos)
+    config[options.app][options.environment]['package_dir'] = '/'.join([options.s3_upload_key_prefix, options.app])
+
+    config = trim_index(config, options)
+
+    return config
+
+
+
+def get_packages_to_keep(config, options):
+    """ figure out packages to keep for cleanup """
+
+    packages_to_keep = []
+    live_packages = config[options.app][options.environment]['deploy_targets']
+    for i in live_packages:
+        packages_to_keep.append(live_packages[i])
+
+    return packages_to_keep
+
+
+
+def trim_index(config, options):
+    """ reduce index size to match number of spare packages to keep """
+
+    packages = list(unique_everseen(config[options.app][options.environment]['packages']))
+
+    ## figure out which packages are used in deploy_targets and keep them
+    keep_packages = get_packages_to_keep(config, options)
+
+    removable_packages = [x for x in packages if x not in keep_packages]
+
+    # remove excess unused packages from the front of the list
+    if len(removable_packages) > options.spare_packages:
+        log.info("Trimming package index...")
+        if options.spare_packages > 0:
+            removable_packages = removable_packages[0:-options.spare_packages]
+        else:
+            pass # leave the list as-is
+    else:
+        removable_packages = []
+
+    # finally, update the list
+    packages = [x for x in packages if x not in removable_packages]
+    config[options.app][options.environment]['packages'] = packages
+
+    return config
+
+
+
+def delete_index_item(config, options, package):
+    """ remove package from index """
+    # not meant to change the current/rollback, just clean up an errant file from the list
+    keep_packages = get_packages_to_keep(config, options)
+    if package in keep_packages:
+        log.warning("Package to be deleted '%s' is a deploy target. No action taken, aborting.", \
+                    package)
+        sys.exit(4)
+    else:
+        try:
+            config[options.app][options.environment]['packages'].remove(package)
+        except ValueError:
+            log.warning("Package to be deleted '%s' is not found in index. No action taken, aborting.", \
+                        package)
+            sys.exit(4)
+        except:
+            raise
+
+    return config
+
+
+
+def delete_deploy_target(s3_bucket, s3_key, options):
+    """ remove a package from the current list """
+
+    if options.package in ['current', 'rollback']:
+        log.error("Will not remove deploy target 'current' or 'rollback'. Aborting.")
+        sys.exit(6)
+
+    log.info("Fetching config at s3://%s/%s...", s3_bucket, s3_key)
+    config = s3_get_yaml(s3_bucket, s3_key)
+
+    log.info("Removing %s from deploy_targets...", options.package)
+    config[options.app][options.environment]['deploy_targets'].pop(options.package, None)
+
+    log.info("Uploading edited config...")
+    s3_put_yaml(s3_bucket, s3_key, config)
+
+    return
+
+
+def list_index(s3_yaml_bucket, s3_yaml_key):
+    """ list current index on s3 """
+
+    config = s3_get_yaml(s3_yaml_bucket, s3_yaml_key)
+    print(yaml.dump(config, default_flow_style=False))
+
+    #print config
+    return
+
+def fetch_package(options):
+    """ pull a package from s3
+    """
+    s3_get_file(options.s3_upload_bucket,
+                '/'.join([options.s3_upload_key_prefix, options.app, options.package]),
+                os.getcwd())
+    return
+
+def main():
+    """ main """
+
+    ### Set Vars
+
+    options = get_options()
+
+    # upload dir prefix:
+    # - user can override
+    # - testing lives in 'testing'
+    # - staging + prod share 'pool', allowing reuse of staging packages for prod
+    # - config files (rather than packages) ignore this, and live in their associated env dirs
+    if not options.s3_upload_key_prefix:
+        if options.environment in ['staging', 'production']:
+            options.s3_upload_key_prefix = 'pool'
+        else:
+            options.s3_upload_key_prefix = options.environment
+
+    options.s3_upload_key = '/'.join([options.s3_upload_key_prefix, options.app, options.package])
+
+    yaml_file = options.app + '.yml'
+    s3_yaml_key = '/'.join([options.environment, yaml_file])
+    s3_yaml_bucket = options.s3_upload_bucket
+
+
+    ### Do Things
+
+    if options.package == 'list':
+        log.info("Listing index for '%s':", options.environment)
+        list_index(s3_yaml_bucket, s3_yaml_key)
+        sys.exit()
+
+    if options.fetch:
+        log.info("Fetching '%s' from 's3://%s'...", \
+                 options.package, '/'.join([options.s3_upload_bucket, options.s3_upload_key_prefix]))
+        fetch_package(options)
+        sys.exit()
+
+    if options.delete_deploy_target:
+        # FIXME: this delete workflow doesn't work (makes no change)
+        log.error("Aborting early - 'delete deploy target' action not working correctly - to be fixed")
+        log.error("(just 'roll-forward' changes instead)")
+        sys.exit(10)
+        delete_deploy_target(s3_yaml_bucket, s3_yaml_key, options)
+        log.info("Done.")
+        sys.exit()
+
+
+    if options.init:
+        log.info("Initialising config for %s with package %s...", \
+                 options.environment, options.package)
+        config = init_skeleton_config(s3_yaml_bucket, s3_yaml_key, options)
+        s3_put_yaml(s3_yaml_bucket, s3_yaml_key, config, newkey=True)
+
+
+    if options.delete:
+        # FIXME: this delete workflow doesn't work (it still puts the nominated
+        # package as the release package)
+        log.error("Aborting early - 'delete' action not working correctly - to be fixed")
+        sys.exit(11)
+        log.info("Mungeing new config...")
+        current_config = s3_get_yaml(s3_yaml_bucket, s3_yaml_key)
+        config = delete_index_item(current_config, options, options.package)
+    elif options.register_only:
+        """ avoid the upload, check the file exists, and pass through to the update below """
+
+        config = s3_get_yaml(s3_yaml_bucket, s3_yaml_key)
+        log.info("Checking package '%s' is on s3...", options.package)
+        if not s3_key_exists(options.s3_upload_bucket, options.s3_upload_key):
+            log.warning("File not found in s3://%s, aborting", options.s3_upload_bucket)
+            sys.exit(7)
+    else:
+        """ upload the file """
+
+        try:
+            config = s3_get_yaml(s3_yaml_bucket, s3_yaml_key)
+        except ClientError as ex:
+            if ex.response['Error']['Code'] == 'NoSuchKey':
+                log.warn('Package index file not found, will initialise a new one')
+                config = init_skeleton_config(s3_yaml_bucket, s3_yaml_key, options)
+                s3_put_yaml(s3_yaml_bucket, s3_yaml_key, config, newkey=True)
+            else:
+                raise ex
+
+        filepath = os.path.join(options.package_path, options.package)
+        log.info("Uploading '%s' to s3://%s/%s...", \
+                 options.package, options.s3_upload_bucket, options.s3_upload_key)
+        s3_upload_file(options.s3_upload_bucket, options.s3_upload_key, filepath)
+
+
+    if options.upload_only:
+        log.info("Skipping s3 index update...")
+    else:
+        log.info("Updating index on s3...")
+        update_index(config, options)
+        s3_put_yaml(s3_yaml_bucket, s3_yaml_key, config)
+
+    # debug
+    #list_index(s3_yaml_bucket, s3_yaml_key)
+
+    log.info("Done.")
+
+    return
+
+if __name__ == '__main__':
+    main()

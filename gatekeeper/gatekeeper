@@ -1,0 +1,566 @@
+#!/usr/bin/env python
+"""
+Bespoke application install script to handle several different types of
+packages, using AWS S3 as a package cache and index store  See the help text
+for more detail
+"""
+
+# originally a boto script, boto3 was implemented only for s3 items, due to
+# time pressure
+
+import sys
+import os
+import pwd
+import grp
+#import errno
+import subprocess
+import argparse
+import textwrap
+import logging
+#import ConfigParser
+import shutil
+#import copy
+import glob
+#import filecmp
+import time
+from time import sleep
+import tarfile as tar
+import requests
+import yaml
+import boto
+#from boto.s3.key import Key
+import boto3
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+# REAL ISO8601
+# (not the 'ISO8601 with several changes to it' of the logging module)
+if time.tzname[0] == 'UTC':
+    formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                  '%Y-%m-%dT%H:%M:%SZ')
+else:
+    if sys.version_info[0] == 2:
+        # python 2's TZ here is stuffed (always reports +00:00) so drop it
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                      '%Y-%m-%dT%H:%M:%S')
+    else:
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                      '%Y-%m-%dT%H:%M:%S%z')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              gatekeeper [-e ENV] [-r] [-s] [-w PATH] ACTION APPLICATION_NAME
+              gatekeeper prepare ecal-app
+              gatekeeper activate ecal-app
+
+            Gatekeeper is a custom deployment script than can be used to deploy .deb
+            files (but no deps possible - uses dpkg) or tar files (for php sites)
+
+            App deployment is done by way of an index file on S3 pointing to
+            packages on s3. The index file is managed by the companion script
+            'gatekeeper-s3-indexer', which is designed to be run from a buildserver.
+
+            The basic philosophy is 'get a package onto s3 and index it, then download
+            from s3 to install'. This avoids any third-party dependencies in the deploy
+            system apart from s3 and the buildserver.
+
+            Gatekeeper lives on the servers, and is designed to be called either on boot
+            (for self-provisioning) or by the buildserver (day-to-day deploys). It deploys
+            in a two-stage process:
+                1) 'prepare' reads the index and gets all files downloaded and in place
+                2) 'activate' reads the index and either does a symlink switch (php) or
+                   deb install as appropriate to the application.
+
+            This allows all servers to reach 'prepare' state before actually activating
+            the new package, when run via buildserver steps.
+
+            Currently gatekeeper can install two types of packages:
+            - tars (assumed to be php websites)
+            - single debs (but it won't satisfy dependencies)
+
+        '''))
+
+    parser.add_argument("action", help='prepare|activate', default='help')
+    parser.add_argument('application', help='the application name', default='help')
+    parser.add_argument('-r', '--region', help='AWS region, defaults to ap-southeast-2', default='ap-southeast-2')
+    parser.add_argument('-e', '--env', help='production/staging/testing/whatever, overriding system detection via EC2 tags')
+    parser.add_argument('-s', '--suppress-reload', help='suppress a reload of services - this is used during cloud-init (which will start those services separately at the very end of setup)', action='store_true')
+    parser.add_argument('-w', '--webbase', help='base dir for web site deploys, and the application name will be a subdir of this (default: /var/www)', default='/var/www')
+    parser.add_argument('-u', '--user', help='installation user, for chowning files to (default: www-data)', default='www-data')
+    parser.add_argument('-g', '--group', help='installation group, for chowning files to (default: www-data)', default='www-data')
+    parser.add_argument('-b', '--s3-bucket', help='s3 bucket to search (default: lkg-packages)', default='lkg-packages')
+    parser.add_argument('-t', '--type', help='install type, tar|deb (default: tar)', default='tar')
+    parser.add_argument('-E', '--envprefix', help='prepend "$env-" to application dirname', action='store_true')
+    parser.add_argument('-R', '--reload-services', help='comma-delimited list of services to reload') # no default = None
+    parser.add_argument('-m', '--multipackage', help="retrieve full package list, not just 'current' (original behaviour)", action='store_true')
+
+    options = parser.parse_args()
+
+    if not options.env:
+        try:
+            options.env = ec2_get_own_tagvalue('env')
+            log.info("Detected env '%s' from ec2 instance tag", options.env)
+        except:
+            log.error("No env supplied, and failed to fetch 'env' ec2 instance tag")
+            raise
+
+    # this should actually be overwritten by read config
+    try:
+        options.s3_prefix
+    except AttributeError:
+        options.s3_prefix = options.env
+
+    #print vars(options)
+
+    return options
+
+#
+# helper functions
+# should be moved to a separate lib at some point
+#
+
+def ec2_get_own_tagvalue(tag, wait_for_tag=False):
+    """ instance needs IAM perms to retrieve own ec2 tags
+    """
+    instance_id_url = 'http://169.254.169.254/latest/meta-data/instance-id'
+    az_url = 'http://169.254.169.254/latest/meta-data/placement/availability-zone'
+
+    instance_id = requests.get(instance_id_url).text
+    region = requests.get(az_url).text[:-1]
+
+    conn = boto.ec2.connect_to_region(region)
+
+    max_attempts = 1
+    if wait_for_tag:
+        max_attempts = wait_for_tag
+
+    attempts = 0
+    while attempts < max_attempts:
+        attempts += 1
+        #print(attempts)
+        try:
+            tags = conn.get_all_tags(filters={'resource-id': instance_id, 'key': tag})
+            if tags[0].value:
+                break
+        except:
+            if attempts < max_attempts:
+                sleep(1)
+            else:
+                if wait_for_tag:
+                    log.error("Couldn't retrieve tag '%s' after %d seconds...", \
+                              tag, max_attempts)
+                raise
+
+    return tags[0].value
+
+def s3_get_file(s3_bucket, s3_key, dest_dir):
+    """ fetch file from s3 and deposit to dest dir
+    """
+
+    filename = os.path.basename(s3_key)
+    filepath = '/'.join([dest_dir, filename])
+
+    s3 = boto3.client('s3')
+    s3.download_file(s3_bucket, s3_key, filepath)
+
+    return filepath
+
+def s3_get_yaml(s3_bucket, s3_key):
+    """ read yaml config residing on s3. needs s3 perms, obviously
+    """
+
+    log.info("Reading yaml config from s3://%s/%s...", s3_bucket, s3_key)
+
+    s3 = boto3.resource('s3')
+    obj = s3.Object(s3_bucket, s3_key)
+
+    s3_string_output = obj.get()['Body'].read()
+
+    config = yaml.load(s3_string_output)
+
+    return config
+
+def chown(path, user, group, recursive=False):
+    """ mostly to make recursive chowning easier
+    """
+
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    if recursive:
+        # FIXME: this breaks on broken symlinks with 'file not found'.
+        # test perhaps with an lstat/ifexists
+        # EDIT: untested - lchown might work around this problem (doesn't follow symlinks)
+        for root, dirs, files in os.walk(path):
+            os.chown(root, uid, gid)
+            for item in dirs:
+                os.lchown(os.path.join(root, item), uid, gid)
+            for item in files:
+                os.lchown(os.path.join(root, item), uid, gid)
+    else:
+        os.chown(path, uid, gid)
+
+def exit_unless_root():
+    """ got root rights? """
+    if not os.geteuid() == 0:
+        log.error('Must run as root. Aborting.')
+        sys.exit(1)
+
+def get_version_from_packagename(package):
+    """ assumes starts with app name + underscore, finishes with canned suffix
+        - ecal-app_1.2.3-b55~afsa.tar.gz / .tgz
+        - nexus_1.2.3-b55~asdfa_amd64.deb
+    """
+
+    # cut off first bit
+    version = package.partition('_')[2]
+
+    # use the suffixes as (excluded) partition values
+    exclude_suffixes = ['.tar.gz', '.tgz', '_amd64.deb', '_all.deb']
+    for suffix in exclude_suffixes:
+        version = version.partition(suffix)[0]
+
+    if version is None:
+        log.error("Package name must be a tar.gz or a .deb, \
+                  and must be prefixed with the app name and an underscore")
+        log.error("(eg: cool-app_v1.2.3+abcd.tar.gz)")
+        raise ValueError("Could not extract version from '%s'!" % package)
+
+    return version
+
+
+def untar_to_dir(tarfile, location):
+    """ python native tarfile handles gz, bz2 automatically
+    """
+
+    with tar.open(tarfile) as tf:
+        tf.extractall(path=location)
+
+
+
+def getconf_s3(options):
+    """ fetch config from s3 """
+
+    # remove traling '-environ'
+    pkg_index_file = options.application + '.yml'
+    #pkg_index_file = options.application + '-' + options.env + '.yml'
+    pkg_index_s3loc = (options.s3_bucket, '/'.join([options.s3_prefix,
+                                                    pkg_index_file]))
+
+
+    try:
+        config = s3_get_yaml(pkg_index_s3loc[0], pkg_index_s3loc[1])
+    except:
+        raise
+
+    return config
+
+
+#
+# functions for this script
+#
+
+
+def phpsite_prepare(options):
+    """ fetch config from s3 for a package list, then pull down the packages for
+        the nominated environment and install them
+
+        installs to {webroot}/options.application/package_version/
+        activation (moving symlink) done by separate 'activate' function
+    """
+
+    # dirs to ensure are present
+    # - 'config' - place env-specific config files here, symlink from app dir
+    # - 'log' - hold log files (or symlink them if stored 'inside' app dir
+    # - 'shared' - other (nonspecific) shared files
+    make_dirs = ['config', 'shared', 'log']
+
+
+    # dirs to keep during cleanup. Should be 'log', 'current' (symlink) the dir
+    # that 'current' is pointing to, and those added during this function
+    keep_dirs = ['config', 'shared', 'log', 'current']
+
+    log.info("Fetching application install config from s3...")
+    config = getconf_s3(options)
+
+
+    pkgfile_bucket = config[options.application][options.env]['package_bucket']
+    pkgfile_s3path = config[options.application][options.env]['package_dir']
+
+    app_dirname = options.application
+    if options.envprefix:
+        app_dirname = '-'.join([options.env, options.application])
+
+    webroot = '/'.join([options.webbase, app_dirname])
+    keep_dirs.append(os.path.basename(os.path.realpath('/'.join([webroot, 'current']))))
+
+    # makes webroot as well as subdirs
+    for subdir in make_dirs:
+        subdir_fullpath = '/'.join([webroot, subdir])
+        if not os.path.exists(subdir_fullpath):
+            os.makedirs(subdir_fullpath)
+            chown(subdir_fullpath, options.user, options.group)
+    chown(webroot, options.user, options.group)
+
+    # fetching more than one package at once is disabled, because it's too heavy on boot
+    # with lots of large apps
+    if not options.multipackage:
+        log.info("Setting package list to current release only (multipackage not enabled)")
+        config[options.application][options.env]['packages'] = [config[options.application][options.env]['deploy_targets']['current']]
+
+
+    log.info("Fetching packages from s3 to local cache...")
+    for pkg in config[options.application][options.env]['packages']:
+
+        localrepo = '/var/tmp'
+
+        if os.path.exists('/'.join([localrepo, pkg])):
+            log.info("... %s already fetched", pkg)
+        else:
+            log.info("... fetching %s", pkg)
+            s3_get_file(pkgfile_bucket, '/'.join([pkgfile_s3path, pkg]), localrepo)
+
+
+
+    log.info("Extracting packages from local cache...")
+    for pkg in config[options.application][options.env]['packages']:
+
+        """ - checks if dir already exists, skips if so
+            - makes the dir
+            - untars package to dir
+            - creates the shared log location symlink
+            - chowns stuff
+        """
+
+        version = get_version_from_packagename(pkg)
+        version_dir = '/'.join([webroot, version])
+        keep_dirs.append(version)
+
+        if not os.path.exists(version_dir):
+            try:
+                log.info("... extracting %s to %s", pkg, version_dir)
+                os.makedirs(version_dir)
+                untar_to_dir('/'.join([localrepo, pkg]), version_dir)
+                os.symlink(webroot + '/log', version_dir + '/log')
+                chown(version_dir, options.user, options.group, recursive=True)
+
+            except:
+                log.error("Failed to untar package, cleaning up and aborting.")
+                shutil.rmtree(version_dir)
+                raise
+
+        else:
+            log.info("... %s already installed in %s, skipping", pkg, webroot)
+
+
+    phpsite_cleanup(webroot,
+                    keep_dirs,
+                    options.application,
+                    config[options.application][options.env]['packages']
+                   )
+
+    log.info("Webroot %s prepared with new packages.", webroot)
+
+    return
+
+
+def phpsite_activate(options):
+
+    """ - get link target
+        - confirm exists
+        - apply link
+        - reload services
+    """
+
+    config = getconf_s3(options)
+
+    # FIXME: hardcoded for the moment. a rollback would change this target in the index file
+    # perhaps have action 'rollback' which sets this?
+    deploy_target = 'current'
+
+    app_dirname = options.application
+    if options.envprefix:
+        app_dirname = '-'.join([options.env, options.application])
+
+    webroot = '/'.join([options.webbase, app_dirname])
+    #webroot = '/'.join([options.webbase, options.application]) + '/'
+    symlink_path = '/'.join([webroot, 'current'])
+    pkg = config[options.application][options.env]['deploy_targets'][deploy_target]
+    new_version = get_version_from_packagename(pkg)
+
+    target_dir = '/'.join([webroot, new_version])
+    log.info("Checking activation directory exists...")
+    if not os.path.isdir(target_dir):
+        raise ValueError("  ... activation directory '%s' does not exist!" % target_dir)
+
+    # TODO: more errorb-checking around this? it is the actual switchover of the app
+    if target_dir == os.path.realpath(symlink_path):
+        log.info('New install same as old install. No action taken')
+        return
+    else:
+        log.info("Switching 'current' to %s", target_dir)
+        # tmp link + move will work if target already exists
+        tmplink = symlink_path + '_tmp'
+        os.symlink(target_dir, tmplink)
+        os.rename(tmplink, symlink_path)
+
+    if not options.suppress_reload:
+        try:
+            if options.reload_services:
+                for service in options.reload_services.split(','):
+                    log.info('Reloading %s...', service)
+                    cmd = 'systemctl reload ' + service
+                    try:
+                        subprocess.check_call(cmd.split())
+                    except:
+                        raise
+        except AttributeError:
+            log.info("No services marked for reload")
+
+
+
+def phpsite_cleanup(webroot, keep_dirs, application, keep_packages):
+    """ delete all subdirs of 'webroot', except those listed in 'keep_dirs'
+        delete any tarfiles in /var/tmp/*gz older than X days
+    """
+
+    log.info("Cleaning up...")
+
+    # "next(os.walk(webroot))[1]" = first level of subdirs
+    remove_dirs = [x for x in next(os.walk(webroot))[1] if x not in keep_dirs]
+
+    for item in remove_dirs:
+        log.info("... removing old app dir '%s'", item)
+        shutil.rmtree('/'.join([webroot, item]))
+
+    remove_tars = glob.glob('/var/tmp/' + application + '*')
+    for item in remove_tars:
+        if os.path.basename(item) not in keep_packages:
+            log.info("... removing old package '%s'", item)
+            os.remove(item)
+
+    return
+
+def s3deb_prepare(options):
+    """ fetch a single (.deb) file from s3, ready to activate
+    """
+
+    localrepo = '/var/tmp'
+
+    log.info("Fetching application install config from s3...")
+    config = getconf_s3(options)
+
+    log.info("Downloading %s files from s3 to local cache...", options.application)
+    pkgfile_bucket = config[options.application][options.env]['package_bucket']
+    pkgfile_s3path = config[options.application][options.env]['package_dir']
+
+    for pkg in config[options.application][options.env]['packages']:
+
+        log.info("  ... fetching %s", pkg)
+        if os.path.exists('/'.join([localrepo, pkg])):
+            log.info("    ... %s already fetched, skipping", pkg)
+        else:
+            s3_get_file(pkgfile_bucket, '/'.join([pkgfile_s3path, pkg]), localrepo)
+
+    deb_cleanup(options.application)
+
+    return
+
+
+def s3deb_activate(options):
+    """ install debfile from prepared files
+    """
+
+    localrepo = '/var/tmp'
+
+    log.info("Installing %s with dpkg...", options.application)
+    config = getconf_s3(options)
+    deb = config[options.application][options.env]['deploy_targets']['current']
+    cmd = "dpkg -i %s" % '/'.join([localrepo, deb])
+    try:
+        subprocess.check_call(cmd.split())
+    except:
+        raise
+
+    return
+
+
+def deb_cleanup(appname):
+    """ delete old debfiles
+    """
+
+    log.info("Cleaning up old app debs...")
+
+    remove_debs = glob.glob('/var/tmp/%s*deb' % appname)
+    now = time.time()
+    for item in remove_debs:
+        if os.stat(item).st_mtime < now - 30 * 86400:
+            log.info("... removing '%s'", item)
+            os.remove(item)
+
+    return
+
+
+def prepare(options):
+    """ pull down package file(s)
+    """
+
+    if options.type == 'tar':
+        phpsite_prepare(options)
+    else:
+        s3deb_prepare(options)
+
+
+
+def activate(options):
+    """ install 'prepared' package file(s)
+    """
+
+    if options.type == 'tar':
+        phpsite_activate(options)
+    else:
+        s3deb_activate(options)
+
+
+def install(options):
+    """ prepare and activate in one step
+    """
+
+    log.info("Preparing files...")
+    prepare(options)
+    log.info("Activating files...")
+    activate(options)
+
+
+def main():
+    """ really quite main!
+    """
+
+    options = getoptions()
+    exit_unless_root()
+
+    if options.action == 'prepare':
+        prepare(options)
+    elif options.action == 'activate':
+        activate(options)
+    elif options.action == 'install':
+        install(options)
+    else:
+        log.warn("Unrecognised action '%s', aborting.", options.action)
+        sys.exit(1)
+
+    log.info("Done.")
+
+
+if __name__ == '__main__':
+    main()
