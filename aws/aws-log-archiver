@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# TODO: automate the iteration over month/day filenames so you don't have
+#       to manually craft an error-prone shell loop
+from __future__ import print_function
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import time
+import datetime
+import gzip        # req python 3.2 for decompress
+try:
+    import lzma as xz
+except ImportError:
+    import pylzma as xz
+import botocore
+import boto3
+import smart_open
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.DEBUG)
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+              aws-log-archiver -s SRC_BKT -p SRC_PREFIX [-d DST_BKT] [-P DST_PREFIX]
+              aws-log-archiver -s my-log-bucket -p s3/my-log-dir/2017-06
+              aws-log-archiver -n -s my-log-bucket -p s3/my-resource-name/2019-02-21 \\
+                    -P archive/s3/my-resource-name
+
+            Collates the thousands of tiny text files that AWS generates into a single XZ archive.
+            Runs much faster from inside the AWS network - s3 access outside is much slower per
+            connection, and there are usually thousands of tiny files.
+
+            Provide a prefix and an archive will be made of all keys below that prefix, and posted
+            into a dir '+archive' or one of your choosing. The '+' is just to help ascii sorting
+            in the s3 web console.
+
+            If the file ends with "gz", it is assumed to be a gzipped file and extracted before
+            recompression. Headers aren't used to determine gzip0risation as this requires an extra
+            request per file to s3. Cloudfront source logs are gzip'd, s3 logs are not.
+
+            Lines beginning with a hash (#) are stripped. Cloudfront logfiles usally start with
+            two of these lines, but I'm not sure if that's always the case. You can omit the
+            comment stripping if you know there are no comments in the data, and you'll probably
+            get a little speed.
+
+            The script is intended to be used in a shell loop providing the days/months that AWS
+            resources use in their naming schemes, so you can archive monthly/daily/hourly based
+            on prefix:
+
+                time for month in {02..05}; do for day in {01..30}; do \\
+                    nice aws-log-achiver -s my-log-bucket -p s3/my-resource-name/2019-$month-$day \\
+                        -P archive/s3/my-resource-name \\
+                done; done
+
+            The script will simply skip prefixes (days) it can't find
+
+            WARNING: you probably don't want to archive 'today's' logs, since the source file
+            deletion happens well after the compress-and-copy, and you probably will lose the
+            most recent loglines
+
+            NOTE: the files are stream-processed, and hence not sorted. Sorting the loglines is
+            the job of the viewer, not this archiver. The contents will be usually in general order
+            if the filenames are datestamped, but the individual lines may be out of order,
+            particularly if there's more than one log supplier.
+
+            Finally, progress dots for compression = 1/10 seconds just to show still alive; progress
+            dots for source file removal = 1/999 files to give a sense of file numbers
+        '''))
+
+    parser.add_argument('-s', '--src-bucket', help='source bucket', required=True)
+    parser.add_argument('-p', '--src-prefix', help='full path prefix to logfiles', required=True)
+    parser.add_argument('-d', '--dst-bucket',
+                        help='if not supplied, will default to the source bucket')
+    parser.add_argument('-P', '--dst-prefix',
+                        help='if not supplied, will be made from an adjusted source prefix')
+    parser.add_argument('-n', '--no-delete',
+                        help='do not delete source files (for testing', action='store_true')
+    parser.add_argument('--no-strip-comments',
+                        help='do not strip comment lines beginning with #', action='store_true')
+
+    parser.add_argument('-q', '--quiet', help='sets loglevel=ERROR, good for cron', action='store_true')
+    parser.add_argument('--loglevel', help='', default='INFO')
+    parser.add_argument('--debug', help='overrides other loglevels', action='store_true')
+
+    options = parser.parse_args()
+
+    try:
+        options.loglevel = getattr(logging, options.loglevel.upper())
+    except:
+        print("Loglevel %s unrecognised, setting to INFO" % options.loglevel)
+        options.loglevel = 20
+    finally:
+        if options.quiet:
+            options.loglevel = logging.ERROR
+        if options.debug:
+            print("logging set to debug")
+            options.loglevel = logging.DEBUG
+
+
+    if not options.dst_bucket:
+        options.dst_bucket = options.src_bucket
+
+    options.src_prefix = options.src_prefix.rstrip('*')
+
+    if not options.dst_prefix:
+        # the '+' is to sort 'archive' ahead of numbers in s3 gui view
+        options.dst_prefix = '/'.join([os.path.dirname(options.src_prefix).rstrip('/'), '+archive'])
+    else:
+        options.dst_prefix = options.dst_prefix.rstrip('/')
+
+    # this will create a slug like "application_2017.07" from
+    # a prefix like "path/to/application/2017.07"
+    src_slug = '_'.join([os.path.basename(os.path.dirname(options.src_prefix)),
+                         os.path.basename(options.src_prefix)])
+    options.dst_keystring = '/'.join([options.dst_prefix, src_slug + '.log.xz'])
+
+    log.debug(vars(options))
+
+    return options
+
+
+def unify_and_compress(options):
+    """ Collect a bunch of (log) files, stream-compress and cat them together,
+        then post to s3 archive location
+    """
+
+    s3 = boto3.client('s3')
+    s3r = boto3.resource('s3')
+    bucket = s3r.Bucket(options.src_bucket)
+
+    src_key = '/'.join([options.src_bucket, options.src_prefix + '*'])
+    dst_key = '/'.join([options.dst_bucket, options.dst_keystring])
+
+    c = xz.LZMACompressor()
+    mark = 0
+    count = 0
+
+    # I wonder if this will behave when it crosses the 5MB multipart upload boundary
+    #with smart_open.smart_open('s3://' + dst_key, 'wb') as stream_out:
+    with smart_open.open('s3://' + dst_key, 'wb') as stream_out:
+        log.info("Compressing and uploading:")
+        log.info("   Source: s3://%s", src_key)
+        log.info("   Destination: s3://%s", dst_key)
+        for obj in bucket.objects.filter(Prefix=options.src_prefix):
+            if obj.key[-2:] == 'gz':
+                data = gzip.decompress(obj.get()['Body'].read()).decode('utf-8')
+            else:
+                data = obj.get()['Body'].read().decode('utf-8')
+
+            if not options.no_strip_comments:
+                # this will slow down the script, but it's already a long-running thing anyway.
+                data = '\n'.join([x for x in data.split('\n') if not x[:1] == '#'])
+
+
+            stream_out.write(c.compress(bytes(data, 'utf-8')))
+            count += 1
+
+            # done by time rather than file as there can be tens of thousands,
+            # and input file size varies widely
+            now = time.time()
+            if now - mark > 10:
+                mark = now
+                sys.stdout.write('.')
+                sys.stdout.flush()
+
+        if count == 0:
+            log.info("No files found at %s, aborting", src_key)
+            sys.exit(9)
+
+        # writes the xz footer
+        stream_out.write(c.flush())
+
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+    log.info("%d source files processed", count)
+
+    try:
+        response = s3.head_object(Bucket=options.dst_bucket, Key=options.dst_keystring)
+        log.info("Archive tarfile size: %s" % response['ContentLength'])
+    except botocore.exceptions.ClientError as err:
+        log.error("Couldn't retrieve metadata for uploaded file s3://%s, aborting: %s", dst_key, err)
+        sys.exit(9)
+
+    return
+
+def delete_source_files(options):
+    """ Delete a bunch of files by prefix on s3
+        the API will only do 1000 at a time, so rinse, repeat until done
+    """
+
+    s3r = boto3.resource('s3')
+    bucket = s3r.Bucket(options.src_bucket)
+
+    log.info('Removing archived source files:')
+
+    while True:
+        """ fetching all keys in one go and then breaking it up doesn't seem to
+            work, as it seems to leave one or two keys per total batch, even
+            though those keys are confirmed in the outgoing delete request. So
+            instead we re-fetch the keylist every round.
+
+            filter option MaxKeys is not 'max keys returned', but 'number of keys
+            per page returned'. It doesn't actually limit the results, so we use
+            .limit() instead. Gah.
+        """
+
+        keys_to_delete = []
+        objlist = bucket.objects.filter(Prefix=options.src_prefix).limit(999)
+
+        for obj in objlist:
+            keys_to_delete.append({'Key': obj.key})
+
+        if not keys_to_delete:
+            break
+
+        bucket.delete_objects(Delete={'Objects': keys_to_delete})
+
+        sys.stdout.write('.')
+        sys.stdout.flush()
+
+    sys.stdout.write('\n')
+    sys.stdout.flush()
+
+    return
+
+
+def s3_key_exists(s3_bucket, s3_key):
+    """ checks a file exists on s3.
+    """
+
+    s3 = boto3.resource('s3')
+    try:
+        s3.Object(s3_bucket, s3_key).load()  # just a HEAD request
+    except botocore.exceptions.ClientError as e:
+        if e.response['Error']['Code'] == "404":
+            return False
+        else:
+            raise
+    else:
+        return True
+
+
+def main():
+    """ ... main? """
+
+    start_time = datetime.datetime.now()
+    options = getoptions()
+
+    formatter = logging.Formatter('%(levelname)s: %(message)s')
+    log_handler = logging.StreamHandler()
+    log_handler.setLevel(options.loglevel)
+    log_handler.setFormatter(formatter)
+    log.addHandler(log_handler)
+
+
+    unify_and_compress(options)
+
+    if not s3_key_exists(options.dst_bucket, options.dst_keystring):
+        log.info("Could not confirm presence of archive tarfile s3://%s, aborting before deleting source files",
+                 '/'.join([options.dst_bucket, options.dst_keystring]))
+        sys.exit(5)
+
+    if not options.no_delete:
+        delete_source_files(options)
+
+    log.info("Execution time: %s", str(datetime.datetime.now() - start_time))
+    log.info("Done.")
+
+    return
+
+if __name__ == '__main__':
+    main()

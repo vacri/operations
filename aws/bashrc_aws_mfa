@@ -1,0 +1,56 @@
+## stick this function in your .bashrc - it won't work as a script as it won't set your shell's AWS_PROFILE
+## If your localhost user name is not your IAM name, you'll need to edit the 'whoami' below to be your IAM name instead
+
+## if we only had one account, we could set the default AWS_PROFILE for all terminals in .bashrc to the 'mfa profile'
+## (when we move to federated accounts, this is possible)
+
+
+aws-mfa () {
+
+    if [ -z "$1" ] || [ -z "$2" ]; then
+        echo "Usage:  aws-mfa lkg|nbl|nuno MFA_CODE"
+        return
+    fi
+
+    case $1 in
+        lkg) AccountID=265577729643; user=$(whoami);;
+        nbl) AccountID=595434911265; user=$(whoami);;
+        nuno) AccountID=888121276633; user=$(whoami);;
+        *) echo "unsupported account '$1'"; return;;
+    esac
+
+
+    # if your unix user and your AWS user don't match, fix it here
+    MFA_ARN="arn:aws:iam::$AccountID:mfa/$user"
+    MFA_TOKEN="$2"
+
+    AWS_FETCH_PROFILE="$1"
+
+    MFA_PROFILE=${AWS_FETCH_PROFILE}-mfa
+
+
+    results=$(aws --profile $AWS_FETCH_PROFILE \
+                    sts \
+                        get-session-token \
+                        --serial-number $MFA_ARN \
+                        --token-code $MFA_TOKEN \
+                        --output text \
+                )
+    if [ "$?" != 0 ]; then echo 'Failed to get session - is MFA code current?'; return; fi
+
+    read -r title aws_access_key_id expiration aws_secret_access_key aws_session_token <<<"$results"
+
+    echo "Setting temporary STS creds for $MFA_PROFILE, expiry = $expiration"
+    aws --profile $MFA_PROFILE configure set aws_access_key_id $aws_access_key_id
+    aws --profile $MFA_PROFILE configure set aws_secret_access_key $aws_secret_access_key
+    aws --profile $MFA_PROFILE configure set region ap-southeast-2
+    aws --profile $MFA_PROFILE configure set aws_session_token $aws_session_token
+
+
+    echo -e "Setting \e[1;97mCURRENT TERMINAL\e[0m to use \e[1;97mAWS_PROFILE=\e[93m$MFA_PROFILE\e[0m"
+    echo "(the same profile can be specified in other terminals and it will use these temp creds)"
+    export AWS_PROFILE=$MFA_PROFILE
+
+    echo -e "You can now use \e[1;97m\$(aws ecr get-login --no-include-email --region ap-southeast-2)\e[0m to log into the AWS docker repo"
+
+}

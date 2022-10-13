@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+""" a deploy hook for dehydrated to call after updating a Let's Encrypt
+    certificate
+"""
+from __future__ import print_function
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import time
+import boto3
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+# real iso8601, not the 'iso8601 with several changes to it' of the logging module
+if time.tzname[0] == 'UTC':
+    formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                  '%Y-%m-%dT%H:%M:%SZ')
+else:
+    if sys.version_info[0] == 2:
+        # python 2's TZ here is stuffed (always reports +00:00) so drop it
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                      '%Y-%m-%dT%H:%M:%S')
+    else:
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                                      '%Y-%m-%dT%H:%M:%S%z')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+                (crontab) /PATH/TO/dehydrated -c --hook /PATH/TO/aws-acm-dehydrated-hook
+
+            aws-acm-dehydrated-hook is intended as a 'hook script', called after
+            'dehydrated' runs its updates. A cronjob should be created to call dehydrated
+            as usual, with this script as a hook
+
+            This script takes the on-disk certificates and uploads them to AWS Certificate
+            Manager, for use in other AWS resources. Dehydrated/Let'sEncrypt is not aware
+            of what happens to the files after they're updated.
+
+            Requirements:
+            - boto3
+            - dehydrated (to call this script as a hook)
+              - dehydrated is a nifty Let's Encrypt client
+              - https://github.com/lukas2511/dehydrated
+              - available in the Debian repos
+            - AWS IAM user with perms to manage certificates
+              - this can be server-role-based (or anything that the boto3 uses)
+            - THE RELEVANT APPLICATION LOAD BALANCER MUST DIRECT THE PATH
+              ".well-known/acme-challenge" TO THE DEHYDRATED DIRECTORY ON THIS SERVER
+              - this script is designed for ALBs, which can route based on path, whereas
+                Classic ELBs and NLBs cannot.
+            - the ACM name MUST match the primary domain in the dehydrated config
+            - the certificate MUST BE 2048-bit, not the Let's Encrypt default of 4096!
+              - ACM does not support 4096... you can upload it, but important fields will
+                be left empty
+            - not a requirement per se, but having an external, independent monitor on the
+              SSL cert expiry is probably a good idea...
+
+        '''))
+
+    parser.add_argument('action', help='dehydrated calls hook scripts with an action',
+                        default='help')
+    parser.add_argument('args', nargs=argparse.REMAINDER)
+
+    options = parser.parse_args()
+
+    return options
+
+def check_existing_cert_in_acm(options):
+    """are we updating an existing cert or installing a new one?
+       return the ARN or an empty string as is fitting
+    """
+
+    cert_arn = ""
+    acm = boto3.client('acm')
+
+    log.info("Checking for existing certificate in ACM...")
+    res = acm.list_certificates()
+
+    cert_arn_list = [x['CertificateArn'] for x in res['CertificateSummaryList']
+                     if x['DomainName'] == options.domain]
+
+    log.debug('list of returned certificate ARNs: %s', cert_arn_list)
+    if len(cert_arn_list) > 1:
+        # warning rather than an error, since these situations are pretty unlikely,
+        # and we don't have a good method set up yet for catching errors or monitoring
+        # SSL expiry
+        log.warning("WARNING: There is more than one certificate with this domain name! " +
+                    "Will update the FIRST cert in the returned list (%s) - this may not " +
+                    "be what you want! Certificate Subject Alternative Names may be " +
+                    "overwritten on the given cert!", cert_arn_list[0])
+
+    if cert_arn_list:
+        cert_arn = cert_arn_list[0]
+
+    log.debug('selected certificate ARN: %s', cert_arn)
+    return cert_arn
+
+
+def upload_cert_to_acm(options):
+    "upload the new dehydrated certificate to ACM"
+
+    acm = boto3.client('acm')
+
+    cert_arn = check_existing_cert_in_acm(options)
+
+    # this bit is because I found the chain cert in the cert.pem,
+    # and boto3/ACM was balking at having two certificates in the
+    # relevant field (chain is supplied as a separate field)
+    # so... this should extract just the first cert, which SHOULD be
+    # the correct one
+    # addendum: this problem was seen with the current (2018-02) github.com
+    # version of dehydrated, but I've reverted to the older apt repo version,
+    # which doesn't have the problem. Leaving the code in, as it
+    # shouldn't hurt...
+    cert = ''
+    with open(options.cert, 'r') as c:
+        line = c.readline()
+        while line:
+            cert += line
+            if line.startswith('-----END CERTIFICATE-----'):
+                break
+            line = c.readline()
+
+    log.debug(cert)
+
+
+
+    try:
+        if cert_arn:
+            log.info("Updating existing cert '%s'...", cert_arn)
+            res = acm.import_certificate(
+                CertificateArn=cert_arn,
+                #Certificate=open(options.cert, 'r').read(),
+                Certificate=cert,
+                PrivateKey=open(options.privkey, 'r').read(),
+                CertificateChain=open(options.chain, 'r').read()
+            )
+        else:
+            log.info("Uploading new cert '%s'...", options.domain)
+            res = acm.import_certificate(
+                #Certificate=open(options.cert, 'r').read(),
+                Certificate=cert,
+                PrivateKey=open(options.privkey, 'r').read(),
+                CertificateChain=open(options.chain, 'r').read()
+            )
+
+        res_arn = res['CertificateArn']
+    except:
+        raise # hrm, what to do...
+
+    return res_arn
+
+
+def deploy_cert(options):
+    "called by dehydrated when a cert is updated"
+
+    options.domain = sys.argv[2]
+    options.privkey = sys.argv[3]
+    options.cert = sys.argv[4]
+    options.fullchain = sys.argv[5]
+    options.chain = sys.argv[6]
+
+    cert_arn = upload_cert_to_acm(options)
+
+    return
+
+def main():
+    "... main?"
+
+    options = getoptions()
+
+    if options.action == 'deploy_cert':
+        deploy_cert(options)
+    else:
+        log.debug("action '%s' is ignored by hook script, exiting", options.action)
+        sys.exit(0)
+
+    log.info('Done')
+
+if __name__ == '__main__':
+    main()
