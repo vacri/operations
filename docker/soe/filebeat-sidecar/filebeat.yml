@@ -1,0 +1,62 @@
+## need to find a way to detect the env/component
+fields_under_root: true
+fields.env: ${env:fb_unset}
+fields.component: ${component:fb_unset}
+
+logging.metrics.enabled: false
+
+# Mount the app log directories from the app container into the relevant locations below
+filebeat.inputs:
+    -
+        type: log
+        paths:
+        - ${logs_directory:/var/www/*/log*}/${logs_filepattern:*.log}
+        tags: ["app"]
+        close_inactive: 24h
+        multiline:
+            pattern: "^\\[[1-2][0-9][0-9][0-9]-"
+            negate: true
+            match: after
+
+
+filebeat.modules:
+    -
+        module: nginx
+        access:
+            enabled: true
+            var.paths: ["/var/log/nginx/*access.log"]
+            close_inactive: 24h
+        error:
+            enabled: true
+            var.paths: ["/var/log/nginx/*error.log"]
+            close_inactive: 24h
+
+
+processors:
+    - add_cloud_metadata: ~
+    - drop_fields:
+        fields:
+            - meta.cloud.availability_zone
+            - meta.cloud.machine_type
+            - meta.cloud.provider
+            - meta.cloud.region
+            - prospector.type
+            - beat
+            - input.type
+            # logstash 6.4 can't parse filebeat 6.4 due to 'host' field... deprecated in 6.4...
+            - host
+
+
+filebeat.config:
+  modules:
+    path: ${path.config}/modules.d/*.yml
+    reload.enabled: false
+
+## This creates listeners on docker-logs... which is already being handled by ECS/GELF
+#filebeat.autodiscover:
+#  providers:
+#    - type: docker
+#      hints.enabled: true
+
+output.logstash:
+  hosts: ${logstash_beats_endpoint:}
