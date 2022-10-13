@@ -13,6 +13,7 @@ As most of these scripts are sanitised, there are some variables at the start th
 | check-redirects   | confirm http redirects for a list of domains |
 | ddvpn-syd         | call with sudo with OpenConnect installed, connects to your Dimension Data Sydney VPN |
 | deploy-s3-site    | uploads repos/local dirs to s3 bucket websites, gzipping appropriate files |
+| di                | get shell on a running docker container |
 | ec2-create-rolling-snapshot | snapshots EC2 volumes, intended as a daily cronjob |
 | kvm-backup        | backup KVM virtual machines that aren't snapshottable (requires VM downtime) |
 | gatekeeper        | tar/zipfile deployer for autoscaled VMs, see README in subdir |
