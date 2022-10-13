@@ -1,0 +1,53 @@
+#!/bin/bash
+# Boilerplate for bash scripts
+# NOTE: positional args are converted from $1 to $ARG1 for use with 'set -u'
+
+# fail immediately on error
+set -e
+set -o errtrace
+set -o pipefail
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME [list of args]
+
+more info in prose form goes here
+EOF
+exit 0
+}
+
+# getopts colon after letter = opt requires an argument (taken as $OPTARG)
+while getopts "ab:" option; do
+    case $option in
+        a) VAR="foo";;
+        b) VAR2="$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$1" ]; then usage; fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u    # fail on unset variables
+
+cleanup(){
+    #echo "Cleaning up..." # do cleanup here
+    :
+}
+
+alert(){
+    #echo "Alert! Errorb!" # don't do cleanup here
+    :
+}
+
+trap cleanup exit # on any exit
+trap alert ERR    # on an error (does not include builtins like 'exit 1')
+
+# script goes here
+
