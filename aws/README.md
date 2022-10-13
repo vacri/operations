@@ -13,4 +13,5 @@ These scripts are all for interaction with AWS, and generally assume you have th
 | aws-acm-dehydrated-hook | allows Dehydrated (Lets Encrypt agent) to upload certs to ACM |
 | aws-log-archiver        | collates squillions of ELB and Cloudfront logfiles into single archive files |
 | bashrc_aws_mfa          | bash alias to ease mfa-enabling awscli |
-
+| ec2-instance-volume-snapshot | snapshot (backup) all EC2 volumes with given tag+value |
+| ec2-remake-lc | automate updating an ASG LC - manually updating is prone to error |

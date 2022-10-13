@@ -1,0 +1,182 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import sys
+import os
+import argparse
+import textwrap
+import logging
+import time
+import base64
+import boto3
+import pprint
+from botocore.exceptions import ClientError
+
+log = logging.getLogger(os.path.basename(sys.argv[0]))
+log.setLevel(logging.INFO)
+# real iso8601, not the 'iso8601 with several changes to it' of the logging module
+if time.tzname[0] == 'UTC':
+    formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                '%Y-%m-%dT%H:%M:%SZ')
+else:
+    if sys.version_info[0] == 2:
+        # python 2's TZ here is stuffed (always reports +00:00) so drop it
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                '%Y-%m-%dT%H:%M:%S')
+    else:
+        formatter = logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s',
+                '%Y-%m-%dT%H:%M:%S%z')
+logHandler = logging.StreamHandler()
+logHandler.setLevel(logging.INFO)
+logHandler.setFormatter(formatter)
+log.addHandler(logHandler)
+
+
+def getoptions():
+    """ ... gets... options? """
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=textwrap.dedent('''
+
+            Usage:
+               ec2-remake-lc [-u path/to/userdata-file] AWS_PROFILE LC_NAME NEW_AMI_ID
+
+               ec2-remake-lc lkg generic-php-c5.large-prod-v6 ami-0ab5f65679205c9ee
+               ec2-remake-lc -u ec2-userdata/gatekeeper-client-lkg lkg generic-php-c5.large-prod-v6 ami-0ab5f65679205c9ee
+
+            Create a new EC2 Launch Configuration (LC) for use in an Autoscaling group - it simply takes your nominated LC, updates the AMI, and uploads it with a version bump. It can also optionally update the UserData field if provided a path to a file with the new userdata content.
+
+            This script assumes your LC name ends with a version number in the form of 'v18', eg 'php-t2micro-stag-moship-v18'
+        '''))
+
+    parser.add_argument('profile', help='', default='help')
+    parser.add_argument('lc_name', help='', default='help')
+    parser.add_argument('ami_id', help='', default='help')
+    parser.add_argument('-u', '--userdata', help='path to file with new userdata', default='')
+    parser.add_argument('--debug', help='enable debug mode', action='store_true')
+
+    try:
+        options = parser.parse_args()
+    except:
+        #maybe do something here?
+        raise
+
+    return options
+
+def fetch_launch_config(session, options):
+    ''' fetch autoscaling group launch config from aws
+    '''
+
+    client = session.client('autoscaling')
+
+    response = client.describe_launch_configurations(
+                LaunchConfigurationNames=[
+                    options.lc_name
+                ])
+
+    launch_config = response['LaunchConfigurations'][0]
+
+    if options.debug is True:
+        pprint.pprint(launch_config)
+
+    return launch_config
+
+def new_lc_name(oldname):
+    ''' generate new launch config name assuming my patterns :) '''
+
+    try:
+        nameparts = oldname.rsplit('v',1)
+        version = int(nameparts.pop())
+        version += 1
+        newname = 'v'.join([nameparts[0], str(version)])
+    except:
+        log.warn("Couldn't parse old LC name, appending .1 to existing name")
+        newname = oldname + ".1"
+
+    return newname
+
+
+def new_lc(session, source_lc, options):
+    ''' create a new launch configuration '''
+
+    newname = new_lc_name(source_lc['LaunchConfigurationName'])
+
+    # need to remove the snapshot IDs from the block devices, as they refer to the original image
+    for block_dev in source_lc['BlockDeviceMappings']:
+        try:
+            block_dev['Ebs'].pop('SnapshotId')
+        except KeyError:
+            continue
+
+    client = session.client('autoscaling')
+    log.info("Creating new launch configuration '%s'...", newname)
+
+
+    userdata = get_userdata(options, source_lc['UserData'])
+
+    if options.debug is True:
+        log.info("Will call create_launch_configuration with following properties")
+        log.info("LaunchConfigurationName: %s",newname)
+        log.info("ImageId: %s", options.ami_id)
+        log.info("SecurityGroups: %s", source_lc['SecurityGroups'])
+
+        if source_lc['UserData'] is not None:
+            # mostly this is to check that the UserData isn't un-decoded base64 stuff
+            log.info("UserData (only first line shown): %s", userdata.splitlines()[0])
+
+        log.info("InstanceType: %s", source_lc['InstanceType'])
+        log.info("BlockDeviceMappings: %s", source_lc['BlockDeviceMappings'])
+        log.info("InstanceMonitoring: %s", source_lc['InstanceMonitoring'])
+        log.info("IamInstanceProfile: %s", source_lc['IamInstanceProfile'])
+
+    try:
+        response = client.create_launch_configuration(
+            LaunchConfigurationName=newname,
+            ImageId=options.ami_id,
+            SecurityGroups=source_lc['SecurityGroups'],
+            UserData=userdata,
+            InstanceType=source_lc['InstanceType'],
+            BlockDeviceMappings=source_lc['BlockDeviceMappings'],
+            InstanceMonitoring=source_lc['InstanceMonitoring'],
+            IamInstanceProfile=source_lc['IamInstanceProfile']
+            )
+
+        return response
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'AlreadyExists':
+            log.error('%s already exists.', newname)
+        else:
+            log.error(e.response['Error']['Code'])
+        sys.exit(1)
+
+def get_userdata(options, source_userdata):
+    if options.userdata is '':
+        return base64.b64decode(source_userdata)
+    else:
+        try:
+            log.info("Inserting userdata from %s..." % options.userdata)
+            with open(options.userdata, "r") as f:
+                return f.read()
+        except IOError as e:
+            log.error(e)
+            log.info('Failed.')
+            sys.exit(1)
+
+
+def main():
+
+    options = getoptions()
+
+    log.info("Fetching source launch configuration...")
+
+    session = boto3.Session(profile_name=options.profile)
+    source_lc = fetch_launch_config(session, options)
+
+    new_lc(session, source_lc, options)
+
+    log.info('Done.')
+
+if __name__ == '__main__':
+    main()

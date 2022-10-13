@@ -1,0 +1,83 @@
+#!/bin/bash
+
+# fail immediately on error
+set -e
+set -o errtrace
+set -o pipefail
+#set -x    # debug mode
+
+tag_key=legacy
+tag_value=true
+PROGNAME=$(basename $0)
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME [-k TAG_KEY] -v [TAG_VALUE] go
+
+Find the EC2 instances with the nominated tag and snapshot their
+volumes
+
+By default this will snapshot volumes for instances tagged
+"$tag_key:$tag_value"
+
+This is a quick and dirty script to cover some emergency backups for
+legacy instances. For example, it doesn't note which mount points
+the snapshot is for (not that we use multiple mountpoints)
+
+EOF
+exit 0
+}
+
+# getopts colon after letter = opt requires an argument (taken as $OPTARG)
+while getopts "ab:" option; do
+    case $option in
+        k) tag_key="$OPTARG";;
+        v) tag_value="$OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$1" ]; then usage; fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u    # fail on unset variables
+
+cleanup(){
+    #echo "Cleaning up..." # do cleanup here
+    :
+}
+
+alert(){
+    #echo "Alert! Errorb!" # don't do cleanup here
+    :
+}
+
+trap cleanup exit # on any exit
+trap alert ERR    # on an error (does not include builtins like 'exit 1')
+
+# script goes here
+
+
+#list=$(aws ec2 describe-instances --filters Name=tag:legacy,Values=true --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`Name`].Value[]]')
+
+list=$(aws ec2 describe-instances --filters Name=tag:legacy,Values=true --query 'Reservations[].Instances[].[InstanceId]' --output text)
+
+for instanceid in $list; do
+    # doing the name fetch in the same query as the list above is hard to parse with bash... should have used python
+    name=$(aws ec2 describe-instances --instance-ids $instanceid --query 'Reservations[].Instances[].[Tags[?Key==`Name`].Value[]]' --output text)
+
+    echo "Making snapshot of volume(s) for $instanceid - '$name'..."
+
+    aws ec2 create-snapshots --instance-specification InstanceId=$instanceid \
+            --description "$instanceid - '$name'" \
+            --copy-tags-from-source volume
+
+done
+
+
+
+
+
