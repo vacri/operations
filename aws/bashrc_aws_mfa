@@ -8,14 +8,13 @@
 aws-mfa () {
 
     if [ -z "$1" ] || [ -z "$2" ]; then
-        echo "Usage:  aws-mfa lkg|nbl|nuno MFA_CODE"
+        echo "Usage:  aws-mfa ACCOUNT1|ACCOUNT2 MFA_CODE"
         return
     fi
 
     case $1 in
-        lkg) AccountID=265577729643; user=$(whoami);;
-        nbl) AccountID=595434911265; user=$(whoami);;
-        nuno) AccountID=888121276633; user=$(whoami);;
+        ACCOUNT1) AccountID=124356789012; user=$(whoami);;
+        ACCOUNT2) AccountID=234567890123; user=$(whoami);;
         *) echo "unsupported account '$1'"; return;;
     esac
 

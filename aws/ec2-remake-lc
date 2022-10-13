@@ -43,8 +43,8 @@ def getoptions():
             Usage:
                ec2-remake-lc [-u path/to/userdata-file] AWS_PROFILE LC_NAME NEW_AMI_ID
 
-               ec2-remake-lc lkg generic-php-c5.large-prod-v6 ami-0ab5f65679205c9ee
-               ec2-remake-lc -u ec2-userdata/gatekeeper-client-lkg lkg generic-php-c5.large-prod-v6 ami-0ab5f65679205c9ee
+               ec2-remake-lc [AWS_PROFILE] generic-php-c5.large-prod-v6 ami-0ab5f65679205c9ee
+               ec2-remake-lc -u ec2-userdata/gatekeeper-client [AWS_PROFILE] generic-php-c5.large-prod-v6 ami-0ab5f65679205c9ee
 
             Create a new EC2 Launch Configuration (LC) for use in an Autoscaling group - it simply takes your nominated LC, updates the AMI, and uploads it with a version bump. It can also optionally update the UserData field if provided a path to a file with the new userdata content.
 

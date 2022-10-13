@@ -233,7 +233,7 @@ def list_sql_dumpfiles(bucket, key, age_limit=None):
 
         example obj record
         {'ETag': '"02ccfe7f93b7b9186ac9d881965f268e-1"',
-         'Key': 'rds/mysql/lkg-mysql-production.ceftnf3lxzbv.ap-southeast-2.rds.amazonaws.com/microservices_prod.sql',
+         'Key': 'rds/mysql/RDSPREFIX.ap-southeast-2.rds.amazonaws.com/microservices_prod.sql',
          'LastModified': datetime.datetime(2019, 9, 2, 10, 17, 5, tzinfo=tzutc()),
          'Size': 54572,
          'StorageClass': 'STANDARD'},

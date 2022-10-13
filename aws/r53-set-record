@@ -30,9 +30,9 @@ def get_options():
             with a standard 300s TTL. script tries to detect the zone from the
             supplied new domain name
 
-            export AWS_PROFILE=nbl
-            for name in adelaide36ers brisbanebullets taipans hawks melbourneutd nzbreakers wildcats semphoenix sydneykings; do
-                 ./r53-set-record testing-${name}.nbldev.net cname testing-spaceship.nbldev.net;
+            export AWS_PROFILE=sportsball
+            for name in club1 club2 club3 club4; do
+                 ./r53-set-record testing-${name}.sportsballdev.net cname testing-site.sportsballdev.net;
             done
 
 

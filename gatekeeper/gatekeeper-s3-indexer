@@ -57,10 +57,10 @@ def get_options():
         description=textwrap.dedent('''\
 
             Usage:
-              s3-package-indexer [OPTIONS] AWS_ACCT ENV APPNAME FULL_PACKAGE_NAME|list
+              s3-package-indexer [OPTIONS] AWS_PROFILE ENV APPNAME FULL_PACKAGE_NAME|list
 
-              s3-package-indexer nbl production nbl-mothership my_new_tarball.tar.gz
-              s3-package-indexer nbl staging nbl-mothership list
+              s3-package-indexer [AWS_PROFILE] production my-application my_new_tarball.tar.gz
+              s3-package-indexer [AWS_PROFILE] staging my-application list
 
             s3-package-indexer is a package manager that uses s3 as a package repository.
             The package format is irrelevant - it is simply stored on S3, and an index is
@@ -89,7 +89,7 @@ def get_options():
 
         '''))
 
-    parser.add_argument('account', help='lkg/nbl', default='help')
+    parser.add_argument('account', help='aws account nickname', default='help')
     parser.add_argument('environment', help='production/staging/testing', default='help')
     parser.add_argument('app', help='application name to deploy', default='help')
     parser.add_argument('package', help="the full package filename", default="help")

@@ -46,7 +46,7 @@ def getoptions():
             'rules' or 'rules-url' is allowed - we don't want to 'fall back'
             and accidentally apply stale rules.
 
-                bucket: ops-slides.lkgtools.net
+                bucket: www.example.net
                 cloudfront-distro: E2Q8IESI0CFY0T
                 rules-url: https://foo.com/abc  # incompatible with 'rules'
                 rules:                        # incompatible with 'rules-url'

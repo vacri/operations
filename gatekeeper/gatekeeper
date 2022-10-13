@@ -99,7 +99,7 @@ def getoptions():
     parser.add_argument('-w', '--webbase', help='base dir for web site deploys, and the application name will be a subdir of this (default: /var/www)', default='/var/www')
     parser.add_argument('-u', '--user', help='installation user, for chowning files to (default: www-data)', default='www-data')
     parser.add_argument('-g', '--group', help='installation group, for chowning files to (default: www-data)', default='www-data')
-    parser.add_argument('-b', '--s3-bucket', help='s3 bucket to search (default: lkg-packages)', default='lkg-packages')
+    parser.add_argument('-b', '--s3-bucket', help='s3 bucket to search (default: my-packages)', default='my-packages')
     parser.add_argument('-t', '--type', help='install type, tar|deb (default: tar)', default='tar')
     parser.add_argument('-E', '--envprefix', help='prepend "$env-" to application dirname', action='store_true')
     parser.add_argument('-R', '--reload-services', help='comma-delimited list of services to reload') # no default = None

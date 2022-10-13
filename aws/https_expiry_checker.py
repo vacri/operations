@@ -42,9 +42,9 @@ def get_options():
             FETCH_CLOUDFRONT_ALIASES=true https-expiry-checker
 
             SNS_ARN=arn:aws:sns:ap-southeast-2:265577729643:paultest \\
-              S3_OVERRIDE_LIST=s3://lkg-configs/operations/ye-olde-override-list.txt \\
+              S3_OVERRIDE_LIST=s3://MYBUCKET/operations/ye-olde-override-list.txt \\
               FETCH_CLOUDFRONT_ALIASES=true \\
-              FETCH_S3_HOSTNAMES=s3://lkg-configs/operations/list-o-hostnames.txt \\
+              FETCH_S3_HOSTNAMES=s3://MYBUCKET/operations/list-o-hostnames.txt \\
               ./https-expiry-checker
 
         This script is NOT a cert VALIDATOR - it only checks expiry times.
