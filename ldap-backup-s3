@@ -1,0 +1,85 @@
+#!/bin/bash
+# Boilerplate for bash scripts
+# NOTE: positional args are converted from $1 to $ARG1 for use with 'set -u'
+
+# fail immediately on error
+set -e
+set -o pipefail
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+dow=$(date +%a)
+ldap_namespace="MYLDAPNAMESPACE"
+mdb_loc="/var/lib/ldap/data.mdb"
+backup_filename="ldap-MYLDAPNAMESPACE-backup-$dow.tar.gz"
+s3_loc="s3://MYBACKUPBUCKET/openldap"
+s3_file="$s3_loc/$backup_filename"
+
+
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME go
+
+Backs up the config database (db 0) and the first user database (db 1), which
+is assumed to be for $ldap_namespace.  Tars up the slapcat dumps plus the mdb,
+and posts that to $s3_loc, on a 1-week rotation
+
+Meant to run as a cronjob, so should be quiet except for errorbs Will need s3
+access to backup location $s3_loc
+EOF
+exit 0
+}
+
+if [ -z "$1" ]; then usage; fi
+
+
+cleanup(){
+    rm -r $tempdir
+}
+
+alert(){
+    #echo "Alert! Errorb!" # don't do cleanup here
+    :
+}
+
+trap cleanup exit # on any exit
+trap alert ERR    # on an error (though can't pass any information about error)
+                  # looks like 'trap ERR' doesn't play nicely with 'set -e'
+
+# script goes here
+tempdir="$(mktemp -d)"
+
+/usr/sbin/slapcat -n 0 -l $tempdir/config.ldif
+/usr/sbin/slapcat -n 1 -l $tempdir/${ldap_namespace}.ldif
+# apparently don't need to stop slapd to copy mdb
+cp $mdb_loc $tempdir/data.mdb
+
+cat << EOF > $tempdir/README.md
+= OpenLDAP Restore =
+
+Backups for OpenLDAP for $ldap_namespace
+* config.ldif = OpenLDAP config db (db 0)
+* ${ldap_namespace} = user data db (db 1)
+* data.mdb = the database itself
+
+Probably you will only want to restore the user data on an existing server,
+which you can do by the following, after clearing out or moving the existing
+data (recreate /var/lib/ldap as an empty dir, owned by user openldap)
+
+    slapadd -l ${ldap_namespace}.ldif
+
+If you want to restore the config db (we don't fiddle with the defaults much),
+you need to specify 'db 0'. You probably don't need to do this for our setup
+
+    slapadd -n 0 -l config.ldif
+
+More info on restore in the following link, though if you are restoring to
+an existing server, you probably don't care about the 'config' database
+https://tylersguides.com/articles/backup-restore-openldap/
+EOF
+
+cd $tempdir
+/bin/tar zcf "$backup_filename" *.ldif *.md*
+/usr/local/bin/aws s3 cp --quiet "$backup_filename" "$s3_file"
+cd - > /dev/null

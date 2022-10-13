@@ -23,12 +23,15 @@ As most of these scripts are sanitised, there are some variables at the start th
 | info.php | php info snippet for testing webserving works |
 | init.boilerplate.centos | init script template for ye olde CentOS, which I never want to touch again |
 | json2yaml         | convert json to human-readable yaml |
+| ldap-backup-s3    | backup an ldap namespace to s3 |
 | meat              | read config files without comments or empty lines (just the 'meat') |
 | mmsdump | use mongodump on an MMS-managed mongodb
 | mongo-backup      | script for making backup tar.gz's from a local mongo |
 | mysql-meta | grab user grants or database metadata without having to remember the sql query to do so... |
+| mysql-restore-from-s3 | restore mysql from backup file on s3 |
 | mysql-tablemigrate | copy a monotonically-increasing large database table (200GB)
 | nginx_[dis|en]site |- make those nginx symlinks! |
+| prometheus-backup-s3 | backups up prometheus via btrfs snapshots to s3 |
 | remove-comments-and-base64-encode | useful for EC2 userdata scripts |
 | send-sms-global   | sends SMSes via SMS Global |
 | snappywrapper     | use the ec2 rolling snapshotter  within AWS, using instance role-based perms |

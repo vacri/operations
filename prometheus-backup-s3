@@ -1,0 +1,79 @@
+#!/bin/bash
+# Boilerplate for bash scripts
+# NOTE: positional args are converted from $1 to $ARG1 for use with 'set -u'
+
+# fail immediately on error
+set -e
+set -o pipefail
+#set -x    # debug mode
+
+PROGNAME=$(basename $0)
+promdata_dir=/var/lib/prometheus # no slash on end
+snapshot_name=prometheus_backup
+s3_loc=s3://MYPROMETHEUSBACKUPBUCKET/
+
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME go
+
+$PROGNAME is used to btrfs-snapshot a prometheus data partition onto s3,
+expecting a rolling window of application data (last 2 or so weeks, constantly
+being trimmed). As a result, we're being a little lazy and just working with
+single snapshots - this method is not ideal for other kinds of data (like a
+root filesystem), where you'd take an initial snapshot and version off that.
+$PROGNAME just sends a new, full backup every day (s3 is cheap).
+
+Requirements:
+- btrfs partition storing prometheus data (currently $promdata_dir)
+- buttersink (via pip)
+- s3 perms
+  - assumes role-based perms, so no keys stored here
+- dedicated s3 bucket (currently $s3_loc)
+  - the tool we use, buttersink, will iterate through the entire bucket, so
+    may as well just give it its own bucket
+
+$PROGNAME is intended to be run as a cronjob
+
+IMPORTANT: The buttersink tool creates a 'trash' folder of old btrfs snapshots,
+in $s3_loc/trash.
+
+The S3 bucket should have a lifecycle rule on this location to expire old
+snapshots. If you want 3 days of backups, expire files here after 3 days, for
+example. If you don't have a lifecycle rule on this location, you'll be adding
+a gzip'd full prometheus data backup every run of $PROGNAME...
+
+EOF
+exit 0
+}
+
+if [ -z "$1" ]; then usage; fi
+
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root"
+   exit 1
+fi
+
+cleanup(){
+    log "Removing temporary btrfs snapshot..."
+    /bin/btrfs subv delete "$snapshot_name"
+    log "Done."
+}
+
+log(){
+    echo "$(date -Is): $@"
+}
+
+trap cleanup exit # on any exit
+
+cd "$promdata_dir"
+log "Creating temporary btrfs snapshot..."
+/bin/btrfs subv snapshot -r . "$snapshot_name"
+
+log "Uploading to S3..."
+/usr/local/bin/buttersink --delete ./ "$s3_loc"
+
+
+
+
+

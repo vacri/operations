@@ -1,0 +1,116 @@
+#!/bin/bash
+set -e
+set -o errtrace
+set -o pipefail
+#set -x
+
+PROGNAME=$(basename $0)
+tmpfile=$(mktemp)
+# if run on a user's localhost, they'll probably have region set in their AWS config, so
+# set to '' to use theirs implicitly
+# presence of 'ec2metadata' is also a cheap 'am I running on ec2?' check
+# (there is no canonical answer to this question https://serverfault.com/a/903599/491315)
+region=$(ec2metadata --availability-zone 2>/dev/null | sed 's/.$//' || echo '')
+if [ -n "$region" ]; then region="--region $region"; fi
+host=''
+user='root'
+pass=''
+port='3306'
+db_name=''
+s3_file=''
+ssm_pwd=''
+
+usage () {
+cat <<EOF
+Usage:
+    $PROGNAME [-u USER] [-p PASS] [-P PORT] [-s PARAM_STORE_PATH] S3_FILE DB_HOST DB_NAME
+    $PROGNAME -u root -s /backups/rds/root-pass s3://mybucket/foo mysql.foo.com mydb | /usr/bin/logger -t $PROGNAME
+    [AWS_PROFILE=myprofile] $PROGNAME s3://mybucket/foo localhost mydb # restoring locally
+
+Fetch a mysql dump from s3 drop/restore to the nominated db_host/db_name
+
+A password can be explicitly supplied, but this is more for debug porpoises.
+The expected use of this script is in cron, pulling the password from Parameter
+Store
+
+If you're restoring to a workstation/localhost version of mysql, you should set
+AWS_PROFILE to the correct setting, and won't need to use any of the options args
+- the db will be restored as the root user
+
+Theoretically the script will also attempt to uncompress a gzip'd backup, but
+this is untested
+
+REQUIREMENTS:
+- mysql cli client
+- IAM perms for Parameter Store if using that
+- s3/network access to dumpfile/target db
+
+LIMITATIONS
+- may need to add "--set-gtid-purged=off" to the restore command depending on
+  the SQL dump
+  - this has not been included already as I'm not 100% sure of the ramifications
+  - GTID is a param that appears sometimes in dumps of master/slave bases
+
+EOF
+exit 0
+}
+
+while getopts "P:u:p:s:r:" option; do
+    case $option in
+        P) port="$OPTARG";;
+        u) user="$OPTARG";;
+        p) pass="$OPTARG";;
+        s) ssm_pwd="$OPTARG";;
+        r) region="--region $OPTARG";;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$1" ]; then usage; fi
+
+# convert positional args to set variables for set -u
+# changes "$1" to "$ARG1" and so on
+ARGCOUNT=0
+for arg; do let ARGCOUNT=$ARGCOUNT+1; declare "ARG$ARGCOUNT"="$arg"; done
+set -u
+
+cleanup(){
+    rm -f "$tmpfile"
+}
+
+alert(){
+    echo "Something went wrong. Should probably alert Slack here" 1>&2
+}
+
+trap cleanup exit
+trap alert ERR
+
+
+
+s3_file="$ARG1"
+host="$ARG2"
+db_name="$ARG3"
+
+if [ -n "$ssm_pwd" ]; then
+    echo "Fetching password from Parameter Store..."
+    export MYSQL_PWD=$(/usr/local/bin/aws $region ssm get-parameter --name $ssm_pwd --query Parameter.Value --output text)
+elif [ -n "$pass" ]; then
+    export MYSQL_PWD="$pass"
+fi
+
+echo "Fetching sql dumpfile..."
+# --quiet stops this cp spamming journalctl with 'blob data' lines
+/usr/local/bin/aws $region s3 cp --quiet "$s3_file" "$tmpfile"
+if [ "${s3_file: -2}" == 'gz' ]; then
+    mv "$tmpfile" "$tmpfile.gz"
+    /bin/gunzip "$tmpfile.gz"
+fi
+
+echo "Blanking $db_name on $host..."
+reset_sql="drop database if exists $db_name; create database $db_name;"
+/usr/bin/mysql -h "$host" -P "$port" -u "$user" <<< "$reset_sql"
+
+echo "Restoring $db_name from $s3_file..."
+/usr/bin/mysql -h "$host" -P "$port" -u "$user" "$db_name" < "$tmpfile"
+
+echo "Done."
